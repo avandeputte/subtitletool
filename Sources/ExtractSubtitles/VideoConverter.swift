@@ -143,10 +143,16 @@ final class VideoConverter {
         case probeFailed(String)
         case noVideoTrack
         case ffmpegFailed(Int32, String)
+        case notEnoughSpace(neededGB: Double, freeGB: Double)
+        case outputTooLarge(projectedGB: Double, sourceGB: Double)
         case cancelled
 
         var errorDescription: String? {
             switch self {
+            case .notEnoughSpace(let need, let free):
+                return String(format: "not enough free space on the destination volume: %.1f GB needed (the size of the source), %.1f GB free", need, free)
+            case .outputTooLarge(let proj, let src):
+                return String(format: "stopped: the MP4 was heading for %.0f GB, larger than the %.0f GB source. Lower the quality in Settings and try again", proj, src)
             case .ffmpegMissing: return "ffmpeg was not found (brew install ffmpeg, or put ffmpeg and ffprobe in the app's Contents/Helpers)"
             case .probeFailed(let m): return "ffprobe could not read the file: \(m)"
             case .noVideoTrack: return "the file has no video track"
@@ -214,6 +220,17 @@ final class VideoConverter {
         let tempURL = finalURL.deletingPathExtension().appendingPathExtension("part.mp4")
         let title = source.deletingPathExtension().lastPathComponent
 
+        // Pre-flight: an HEVC re-encode should end up smaller than the source, so the source size is the budget.
+        let sourceBytes = (try? FileManager.default.attributesOfItem(atPath: source.path)[.size] as? Int64) ?? 0
+        sourceSize = sourceBytes
+        if let values = try? finalURL.deletingLastPathComponent().resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+           let free = values.volumeAvailableCapacityForImportantUsage {
+            log(String(format: "  source %.1f GB, %.1f GB free on the destination volume", Double(sourceBytes) / 1e9, Double(free) / 1e9))
+            if free < sourceBytes {
+                throw Failure.notEnoughSpace(neededGB: Double(sourceBytes) / 1e9, freeGB: Double(free) / 1e9)
+            }
+        }
+
         // Short, plain-ASCII paths for ffmpeg's filter graph: a temp folder with symlinks.
         let work = FileManager.default.temporaryDirectory.appendingPathComponent("ExtractSubtitles-\(ProcessInfo.processInfo.processIdentifier)-\(UInt32.random(in: 0...UInt32.max))")
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
@@ -232,6 +249,11 @@ final class VideoConverter {
             if cancel.isCancelled {
                 try? FileManager.default.removeItem(at: tempURL)
                 throw Failure.cancelled
+            }
+            if let guardFailure = outcome.guardFailure {
+                try? FileManager.default.removeItem(at: tempURL)
+                log("  \(guardFailure.localizedDescription)")
+                throw guardFailure
             }
             if outcome.status == 0 { break }
             try? FileManager.default.removeItem(at: tempURL)
@@ -420,14 +442,20 @@ final class VideoConverter {
         } else {
             a += ["-profile:v", "main", "-pix_fmt", "nv12"]
         }
+        let pixels = Double(v.width * v.height)
+        let q = max(0.5, min(1.0, options.quality))
         if bitrateMode {
-            let pixels = Double(v.width * v.height)
             let base = pixels >= 3_500_000 ? 30.0 : (pixels >= 1_500_000 ? 12.0 : 5.0)   // Mbit/s at quality 0.85
-            let mbps = base * max(0.4, options.quality / 0.85)
+            let mbps = base * max(0.4, q / 0.85)
             a += ["-b:v", "\(Int(mbps * 1000))k"]
         } else {
-            a += ["-q:v", "\(VideoConverter.videotoolboxQ(options.quality))"]
+            a += ["-q:v", "\(VideoConverter.videotoolboxQ(q))"]
         }
+        // Hard ceiling on the video bitrate whatever the quality mode does: a Blu-ray's HEVC should never
+        // come out above its own bitrate. 4K: 30-50 Mbit/s, 1080p: 12-20, smaller: 5-8 (scaled by the slider).
+        let capBase = pixels >= 3_500_000 ? 50.0 : (pixels >= 1_500_000 ? 20.0 : 8.0)
+        let capMbps = capBase * (0.6 + 0.4 * (q - 0.5) / 0.5)
+        a += ["-maxrate", "\(Int(capMbps * 1000))k", "-bufsize", "\(Int(capMbps * 2000))k"]
         for (flag, value) in [("-color_primaries", v.colorPrimaries), ("-color_trc", v.colorTransfer), ("-colorspace", v.colorSpace), ("-color_range", v.colorRange)]
             where !value.isEmpty && value != "unknown" {
             a += [flag, value]
@@ -468,7 +496,12 @@ final class VideoConverter {
         var status: Int32
         var frames: Int
         var errorText: String
+        var guardFailure: Failure?
     }
+
+    private var sourceSize: Int64 = 0
+    private let guardLock = NSLock()
+    private var guardFailure: Failure?
 
     private func runFFmpeg(_ ffmpeg: URL, args: [String], duration: Double) throws -> Outcome {
         let p = Process()
@@ -492,24 +525,39 @@ final class VideoConverter {
         out.fileHandleForReading.readabilityHandler = { h in
             let d = h.availableData
             if d.isEmpty { return }
-            state.feed(d) { frame, fps, outTime, speed in
+            state.feed(d) { [weak self] frame, fps, outTime, speed, totalSize in
                 let fraction = duration > 0 ? max(0, min(0.999, outTime / duration)) : 0
                 var eta: Double?
                 if speed > 0, duration > 0 { eta = max(0, duration - outTime) / speed }
                 else if fraction > 0.01 { let el = Date().timeIntervalSince(started); eta = el * (1 - fraction) / fraction }
                 progressCB(Progress(fraction: fraction, fps: fps, etaSeconds: eta, framesEncoded: frame))
+                // Size guard: after a minute of output, project the final size; stop when it beats the source.
+                if let self = self, outTime > 60, duration > 0, totalSize > 0, self.sourceSize > 0 {
+                    let projected = Double(totalSize) / outTime * duration
+                    if projected > Double(self.sourceSize) * 1.2 {
+                        self.guardLock.lock()
+                        if self.guardFailure == nil {
+                            self.guardFailure = .outputTooLarge(projectedGB: projected / 1e9, sourceGB: Double(self.sourceSize) / 1e9)
+                        }
+                        self.guardLock.unlock()
+                    }
+                }
             }
         }
+        guardLock.lock(); guardFailure = nil; guardLock.unlock()
         try p.run()
+        var tripped: Failure?
         while p.isRunning {
             if cancel.isCancelled { p.terminate(); break }
+            guardLock.lock(); tripped = guardFailure; guardLock.unlock()
+            if tripped != nil { p.terminate(); break }
             Thread.sleep(forTimeInterval: 0.25)
         }
         p.waitUntilExit()
         out.fileHandleForReading.readabilityHandler = nil
         err.fileHandleForReading.readabilityHandler = nil
         let restOut = out.fileHandleForReading.readDataToEndOfFile()
-        if !restOut.isEmpty { state.feed(restOut) { _, _, _, _ in } }
+        if !restOut.isEmpty { state.feed(restOut) { _, _, _, _, _ in } }
         let restErr = err.fileHandleForReading.readDataToEndOfFile()
         errLock.lock(); errorText.append(restErr); let errData = errorText; errLock.unlock()
         let text = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -517,7 +565,7 @@ final class VideoConverter {
         if p.terminationStatus == 0 {
             log(String(format: "  encoded %d frames in %.0f s (%.1f fps)", state.frames, elapsed, elapsed > 0 ? Double(state.frames) / elapsed : 0))
         }
-        return Outcome(status: p.terminationStatus, frames: state.frames, errorText: String(text.suffix(400)))
+        return Outcome(status: p.terminationStatus, frames: state.frames, errorText: String(text.suffix(400)), guardFailure: tripped)
     }
 
     /// Parses ffmpeg's `-progress` key=value stream.
@@ -527,8 +575,9 @@ final class VideoConverter {
         private var fps = 0.0
         private var outTime = 0.0
         private var speed = 0.0
+        private var totalSize: Int64 = 0
 
-        func feed(_ data: Data, report: (Int, Double, Double, Double) -> Void) {
+        func feed(_ data: Data, report: (Int, Double, Double, Double, Int64) -> Void) {
             buffer.append(data)
             while let nl = buffer.firstIndex(of: 0x0A) {
                 let line = String(decoding: buffer[buffer.startIndex ..< nl], as: UTF8.self)
@@ -542,7 +591,8 @@ final class VideoConverter {
                 case "out_time_us": outTime = (Double(value) ?? 0) / 1_000_000
                 case "out_time_ms": if outTime == 0 { outTime = (Double(value) ?? 0) / 1_000_000 }  // older ffmpeg: microseconds despite the name
                 case "speed": speed = Double(value.replacingOccurrences(of: "x", with: "")) ?? speed
-                case "progress": report(frames, fps, outTime, speed)
+                case "total_size": totalSize = Int64(value) ?? totalSize
+                case "progress": report(frames, fps, outTime, speed, totalSize)
                 default: break
                 }
             }
