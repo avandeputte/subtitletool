@@ -42,6 +42,9 @@ final class VideoConverter {
         /// SRT files to embed as subtitle tracks (the ones this job just extracted); when empty,
         /// the MKV's own text subtitle tracks are embedded instead.
         var extraSubtitleFiles: [URL] = []
+        /// Extracted `<movie>.<lang>.forced.sup` files. Burned in when the MKV itself flags no forced track
+        /// (Blu-ray rips usually mark "forced" only inside the PGS data, which TrackAnalysis reads).
+        var forcedSupFiles: [URL] = []
     }
 
     struct Progress {
@@ -270,6 +273,7 @@ final class VideoConverter {
     struct Plan {
         var video: StreamInfo
         var burned: StreamInfo?
+        var burnedInput: Int?      // ffmpeg input number of an extracted forced .sup to burn in
         var extraInputs: [URL] = []
         var audioOutputs: [AudioOutput] = []
         var subtitleOutputs: [SubtitleOutput] = []
@@ -294,17 +298,31 @@ final class VideoConverter {
                 let n = "the forced subtitle track is text (\(t.codecName)); it is added as a forced subtitle track instead of being burned in"
                 log("  \(n)")
                 notes.append(n)
+            } else if let sup = pickForcedSup(defaultLanguage: defaultAudio?.languageTag ?? "", title: title) {
+                plan.extraInputs.append(sup)
+                plan.burnedInput = plan.extraInputs.count
+                log("  burn-in: extracted forced subtitles \(sup.lastPathComponent)")
             } else {
                 log("  no forced subtitle track; converting without burn-in")
             }
         }
 
         // Audio: everything passed through; DTS / TrueHD also get an AC-3 copy; odd codecs become AAC.
-        let defaultAudio = audio.first(where: { $0.isDefault }) ?? audio.first
+        func wantsAC3Copy(_ a: StreamInfo) -> Bool {
+            options.ac3Copies && !a.appleCanPlay && !a.needsTranscodeForMP4
+                && !audio.contains(where: { $0.index != a.index && ($0.codecName == "ac3" || $0.codecName == "eac3") && $0.language == a.language })
+        }
+        var defaultAudio = audio.first(where: { $0.isDefault }) ?? audio.first
+        // A default track Apple players cannot decode (TrueHD / DTS) that gets no AC-3 copy would start
+        // the movie silent in QuickTime: make the first playable track of the same language the default.
+        if let d = defaultAudio, !d.appleCanPlay, !d.needsTranscodeForMP4, !wantsAC3Copy(d),
+           let playable = audio.first(where: { $0.appleCanPlay && $0.language == d.language }) ?? audio.first(where: { $0.appleCanPlay }) {
+            defaultAudio = playable
+            log("  default audio: \(playable.describe) (the source default cannot be played by Apple players)")
+        }
         for a in audio {
             let langName = Naming.displayName(a.languageTag)
-            let wantsCopy = options.ac3Copies && !a.appleCanPlay && !a.needsTranscodeForMP4
-                && !audio.contains(where: { $0.index != a.index && ($0.codecName == "ac3" || $0.codecName == "eac3") && $0.language == a.language })
+            let wantsCopy = wantsAC3Copy(a)
             let isDefault = a.index == defaultAudio?.index
             if a.needsTranscodeForMP4 {
                 plan.audioOutputs.append(AudioOutput(stream: a, isCopy: false, transcode: "aac", isDefault: isDefault,
@@ -336,7 +354,7 @@ final class VideoConverter {
                 let d = TimedText.describe(fileName: srt.lastPathComponent, movie: title)
                 let lang = MP4Language.code(d.tag)
                 let name = TimedText.trackName(tag: d.tag, name: d.name, forced: d.forced, sdh: d.sdh, commentary: d.commentary)
-                if d.forced, plan.burned != nil { continue }
+                if d.forced, plan.burned != nil || plan.burnedInput != nil { continue }
                 plan.subtitleOutputs.append(SubtitleOutput(inputIndex: plan.extraInputs.count, streamSpec: "\(plan.extraInputs.count):0",
                                                            language: lang, title: name, forced: d.forced))
             }
@@ -354,6 +372,17 @@ final class VideoConverter {
         if pgsLeft > 0 { log("  \(pgsLeft) PGS subtitle track(s) left out (MP4 cannot carry bitmap subtitles)") }
     }
 
+    /// The extracted forced .sup to burn in: the default audio's language first, then English, then any.
+    private func pickForcedSup(defaultLanguage: String, title: String) -> URL? {
+        let files = options.forcedSupFiles.filter { FileManager.default.fileExists(atPath: $0.path) }
+        guard !files.isEmpty else { return nil }
+        func base(_ tag: String) -> String { Naming.shortCode(tag).split(separator: "-").first.map(String.init) ?? tag }
+        func lang(_ u: URL) -> String { base(TimedText.describe(fileName: u.lastPathComponent, movie: title).tag) }
+        return files.first(where: { lang($0) == base(defaultLanguage) })
+            ?? files.first(where: { lang($0) == "en" })
+            ?? files.first
+    }
+
     // MARK: - ffmpeg command line
 
     private func arguments(plan: Plan, probe: Probe.Info, title: String, output: URL, bitrateMode: Bool) -> [String] {
@@ -363,13 +392,21 @@ final class VideoConverter {
 
         // Video
         let v = plan.video
-        if let b = plan.burned {
-            let graph = "[0:v:\(v.typeIndex)][0:s:\(b.typeIndex)]overlay=eof_action=pass:format=\(v.isTenBit ? "yuv420p10" : "yuv420")[v]"
-            a += ["-filter_complex", graph, "-map", "[v]"]
+        // PGS canvases are often 1920x1080 on a 3840x2160 picture: scale the subtitle layer to the
+        // video size first, or overlay draws it at half size in the top-left quarter.
+        func burnGraph(_ sub: String) -> String {
+            "[\(sub)][0:v:\(v.typeIndex)]scale2ref=w=iw:h=ih[sub][base];"
+                + "[base][sub]overlay=eof_action=pass:format=\(v.isTenBit ? "yuv420p10" : "yuv420")[v]"
+        }
+        if let k = plan.burnedInput {
+            a += ["-filter_complex", burnGraph("\(k):s:0"), "-map", "[v]"]
+        } else if let b = plan.burned {
+            a += ["-filter_complex", burnGraph("0:s:\(b.typeIndex)"), "-map", "[v]"]
         } else {
             a += ["-map", "0:v:\(v.typeIndex)"]
         }
         a += ["-c:v", "hevc_videotoolbox", "-tag:v", "hvc1", "-allow_sw", "1"]
+        if !v.language.isEmpty { a += ["-metadata:s:v:0", "language=\(v.language)"] }
         if v.isTenBit {
             a += ["-profile:v", "main10", "-pix_fmt", "p010le"]
         } else {
