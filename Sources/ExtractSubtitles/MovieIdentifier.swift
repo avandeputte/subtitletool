@@ -68,7 +68,7 @@ enum FilenameParser {
         // MakeMKV / disc-rip suffixes: "_t00", " t12", "-t3", "(1)", "copy", "_title00", "title_t00"
         name = name.replacingOccurrences(of: #"(?i)[\s_\-]*t\d{1,2}$"#, with: "", options: .regularExpression)
         name = name.replacingOccurrences(of: #"(?i)[\s_\-]*title[\s_]*\d*$"#, with: "", options: .regularExpression)
-        name = name.replacingOccurrences(of: #"(?i)\s*\(\d+\)$|\s+copy(\s+\d+)?$"#, with: "", options: .regularExpression)
+        name = name.replacingOccurrences(of: #"(?i)\s*\(\d{1,2}\)$|\s+copy(\s+\d+)?$"#, with: "", options: .regularExpression)
         // Disc-label prefixes such as "B1_", "D2_", "A_" that MakeMKV keeps from multi-disc sets.
         name = name.replacingOccurrences(of: #"^[A-Za-z]\d?_(?=[A-Za-z])"#, with: "", options: .regularExpression)
 
