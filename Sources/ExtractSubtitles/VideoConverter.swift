@@ -36,7 +36,7 @@ enum FFmpegTool {
 final class VideoConverter {
 
     struct Options {
-        var quality: Double = 0.85          // 0...1 → hevc_videotoolbox -q:v 1...100
+        var quality: Double = 0.85          // 0.5...1 → hevc_videotoolbox -q:v (see videotoolboxQ)
         var burnInSubtitles: Bool = true     // burn the forced PGS subtitle track, if any
         var ac3Copies: Bool = true           // AC-3 copy of every DTS / TrueHD track
         /// SRT files to embed as subtitle tracks (the ones this job just extracted); when empty,
@@ -178,6 +178,14 @@ final class VideoConverter {
         self.cancel = cancel
         self.log = log
         self.progress = progress
+    }
+
+    /// hevc_videotoolbox's -q:v is 1...100 but far from linear: on a 4K HDR Blu-ray q 85 produced ~150 Mbit/s,
+    /// twice the source. The slider (0.5...1.0) therefore maps to q 50...75 (0.85 → 66), the range where the
+    /// encoder lands between roughly a quarter and the full bitrate of a Blu-ray source.
+    static func videotoolboxQ(_ quality: Double) -> Int {
+        let q = 50 + (max(0.5, min(1.0, quality)) - 0.5) / 0.5 * 25
+        return max(1, min(100, Int(q.rounded())))
     }
 
     /// "<folder>/<basename>.mp4", never the source, never an existing file.
@@ -418,7 +426,7 @@ final class VideoConverter {
             let mbps = base * max(0.4, options.quality / 0.85)
             a += ["-b:v", "\(Int(mbps * 1000))k"]
         } else {
-            a += ["-q:v", "\(max(1, min(100, Int((options.quality * 100).rounded()))))"]
+            a += ["-q:v", "\(VideoConverter.videotoolboxQ(options.quality))"]
         }
         for (flag, value) in [("-color_primaries", v.colorPrimaries), ("-color_trc", v.colorTransfer), ("-colorspace", v.colorSpace), ("-color_range", v.colorRange)]
             where !value.isEmpty && value != "unknown" {

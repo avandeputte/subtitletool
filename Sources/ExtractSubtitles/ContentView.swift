@@ -289,7 +289,7 @@ struct SettingsView: View {
                 HStack {
                     Text("Quality")
                     Slider(value: $h265Quality, in: 0.5 ... 1.0, step: 0.05)
-                    Text(String(format: "%.2f", h265Quality))
+                    Text(String(format: "%.2f (ffmpeg q %d)", h265Quality, VideoConverter.videotoolboxQ(h265Quality)))
                         .monospacedDigit()
                         .frame(width: 40, alignment: .trailing)
                 }
