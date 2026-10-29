@@ -94,6 +94,12 @@ final class MatroskaDemuxer {
     private(set) var tracks: [SubtitleTrack] = []
     private var segmentDataStart = 0
     private var segmentEnd = 0
+    private var cuesOffset: Int?
+
+    /// Tuning for readFrames; overridable for benchmarks.
+    static var parallelReaders = 16
+    static var sparseWindow = 8 * 1024         // SSD / network: read only around block headers
+    static var streamingWindow = 4 * 1024 * 1024 // spinning disk: one reader streaming large chunks
 
     init(url: URL) throws {
         reader = try EBMLReader(url: url)
@@ -118,6 +124,8 @@ final class MatroskaDemuxer {
             switch e.id {
             case MKV.info: self.parseInfo(e)
             case MKV.tracks: self.parseTracks(e); foundTracks = true
+            case MKV.seekHead: self.parseSeekHead(e)
+            case MKV.cues: self.cuesOffset = e.headerStart
             default: break
             }
             return !(foundTracks && self.timestampScale != 0 && e.id == MKV.cluster)
@@ -151,6 +159,48 @@ final class MatroskaDemuxer {
             guard let end = child.dataEnd else { continue }
             reader.pos = end
         }
+    }
+
+    private func parseSeekHead(_ e: EBMLReader.Element) {
+        for seek in children(of: e) where seek.id == MKV.seek {
+            var id: UInt64 = 0, position: UInt64?
+            for c in children(of: seek) {
+                if c.id == MKV.seekID { id = reader.uint(c) }
+                if c.id == MKV.seekPosition { position = reader.uint(c) }
+            }
+            if id == UInt64(MKV.cues), let p = position { cuesOffset = segmentDataStart + Int(p) }
+        }
+    }
+
+    /// Cluster start offsets listed in the Cues (normally one per video keyframe), sorted.
+    /// Empty when the file has no usable Cues.
+    private func cueClusterOffsets() -> [Int] {
+        guard let offset = cuesOffset, offset < segmentEnd else { return [] }
+        var r = EBMLReader(file: reader.file, windowSize: 1024 * 1024)
+        r.pos = offset
+        guard let cues = try? r.readElementHeader(), cues.id == MKV.cues, let end = cues.dataEnd, end <= r.count else { return [] }
+        var result = Set<Int>()
+        r.pos = cues.dataOffset
+        while r.pos < end {
+            guard let point = try? r.readElementHeader(), let pend = point.dataEnd, pend <= end else { break }
+            if point.id == MKV.cuePoint {
+                r.pos = point.dataOffset
+                while r.pos < pend {
+                    guard let tp = try? r.readElementHeader(), let tend = tp.dataEnd, tend <= pend else { break }
+                    if tp.id == MKV.cueTrackPositions {
+                        r.pos = tp.dataOffset
+                        while r.pos < tend {
+                            guard let c = try? r.readElementHeader(), let cend = c.dataEnd, cend <= tend else { break }
+                            if c.id == MKV.cueClusterPosition { result.insert(segmentDataStart + Int(r.uint(c))) }
+                            r.pos = cend
+                        }
+                    }
+                    r.pos = tend
+                }
+            }
+            r.pos = pend
+        }
+        return result.filter { $0 < segmentEnd }.sorted()
     }
 
     private func children(of e: EBMLReader.Element) -> [EBMLReader.Element] {
@@ -236,7 +286,12 @@ final class MatroskaDemuxer {
 
     // MARK: - Frames
 
-    /// Reads every frame of the given subtitle tracks, keyed by track number.
+    /// Reads every frame of the given subtitle tracks, keyed by track number, in one pass.
+    ///
+    /// Only the bytes around block headers are read: a subtitle block is copied, every other block
+    /// (video, audio) is skipped with the next read starting at the following header. On SSDs and
+    /// network volumes the file is split at the cluster offsets from the Cues and read by several
+    /// threads at once, which keeps enough reads in flight to saturate the drive.
     func readFrames(for wanted: [SubtitleTrack],
                     progress: ((Double) -> Void)? = nil) throws -> [UInt64: [SubtitleFrame]] {
         var frames: [UInt64: [SubtitleFrame]] = [:]
@@ -245,16 +300,82 @@ final class MatroskaDemuxer {
         for n in wantedNumbers { frames[n] = [] }
         guard !wantedNumbers.isEmpty else { return frames }
 
-        var lastReport = Date.distantPast
-
+        // First cluster: where the scan starts.
+        var firstCluster: Int?
         try forEachTopLevel { e in
-            guard e.id == MKV.cluster else { return true }
-            if let p = progress, Date().timeIntervalSince(lastReport) > 0.2 {
-                lastReport = Date()
-                p(Double(e.headerStart - self.segmentDataStart) / Double(max(1, self.segmentEnd - self.segmentDataStart)))
-            }
-            try self.parseCluster(e, wanted: wantedNumbers, tracks: byNumber, into: &frames)
+            if e.id == MKV.cluster { firstCluster = e.headerStart; return false }
             return true
+        }
+        guard let scanStart = firstCluster else { progress?(1); return frames }
+
+        let file = reader.file
+        let parallel = !file.isRotational && Self.parallelReaders > 1
+        var bounds = [scanStart]
+        if parallel {
+            // Split points: cluster offsets from the Cues, spread into ~4 pieces per reader so a
+            // reader that finishes early picks up another piece.
+            let offsets = cueClusterOffsets().filter { $0 > scanStart }
+            let pieces = min(offsets.count, Self.parallelReaders * 4 - 1)
+            if pieces > 0 {
+                for k in 1 ... pieces {
+                    let target = scanStart + (segmentEnd - scanStart) * k / (pieces + 1)
+                    let i = offsets.firstIndex { $0 >= target } ?? offsets.count - 1
+                    if offsets[i] > bounds.last! { bounds.append(offsets[i]) }
+                }
+            }
+            // Only split at offsets that really hold a Cluster header; otherwise read it as one piece.
+            var probe = EBMLReader(file: file, windowSize: 4096)
+            let valid = bounds.dropFirst().allSatisfy { offset in
+                probe.pos = offset
+                return (try? probe.readElementHeader())?.id == MKV.cluster
+            }
+            if !valid { bounds = [scanStart] }
+        }
+        bounds.append(segmentEnd)
+        let ranges = (0 ..< bounds.count - 1).map { bounds[$0] ..< bounds[$0 + 1] }
+
+        let lock = NSLock()
+        var results = [[UInt64: [SubtitleFrame]]](repeating: [:], count: ranges.count)
+        var failure: Error?
+        var bytesDone = 0
+        var lastReport = Date.distantPast
+        let total = Double(max(1, segmentEnd - scanStart))
+        let report: (Int) -> Void = { bytes in
+            lock.lock()
+            bytesDone += bytes
+            let now = Date()
+            let due = now.timeIntervalSince(lastReport) > 0.2
+            if due { lastReport = now }
+            let fraction = Double(bytesDone) / total
+            lock.unlock()
+            if due { progress?(fraction) }
+        }
+        let windowSize = parallel ? Self.sparseWindow : Self.streamingWindow
+        let next = NSLock()
+        var nextPiece = 0
+
+        DispatchQueue.concurrentPerform(iterations: min(ranges.count, parallel ? Self.parallelReaders : 1)) { _ in
+            let r = EBMLReader(file: file, windowSize: windowSize)
+            while true {
+                next.lock()
+                let piece = nextPiece
+                nextPiece += 1
+                next.unlock()
+                guard piece < ranges.count else { return }
+                var local: [UInt64: [SubtitleFrame]] = [:]
+                do {
+                    try self.scanClusters(in: ranges[piece], reader: r, wanted: wantedNumbers, tracks: byNumber,
+                                          into: &local, report: report)
+                } catch {
+                    lock.lock(); failure = failure ?? error; lock.unlock()
+                }
+                lock.lock(); results[piece] = local; lock.unlock()
+            }
+        }
+        if let failure { throw failure }
+        if file.failed { throw EBMLReader.Failure.readError }
+        for part in results {
+            for (n, list) in part { frames[n, default: []].append(contentsOf: list) }
         }
 
         // Fill in missing durations (SimpleBlocks carry none): use the gap to the next cue.
@@ -273,21 +394,45 @@ final class MatroskaDemuxer {
         return frames
     }
 
-    private func parseCluster(_ cluster: EBMLReader.Element,
+    /// Walks the level-1 elements that start inside `range` (its lower bound is a Cluster start)
+    /// and collects the wanted frames of every Cluster.
+    private func scanClusters(in range: Range<Int>, reader base: EBMLReader,
+                              wanted: Set<UInt64>, tracks: [UInt64: SubtitleTrack],
+                              into frames: inout [UInt64: [SubtitleFrame]],
+                              report: (Int) -> Void) throws {
+        var r = base
+        r.pos = range.lowerBound
+        while r.pos < range.upperBound {
+            let start = r.pos
+            guard let e = try? r.readElementHeader() else { break }
+            if e.id == MKV.cluster {
+                r.pos = try parseCluster(e, reader: r, wanted: wanted, tracks: tracks, into: &frames)
+            } else if let end = e.dataEnd {
+                r.pos = end
+            } else {
+                break   // an unknown-sized element other than a Cluster: nothing more to find
+            }
+            guard r.pos > start else { break }
+            report(min(r.pos, range.upperBound) - start)
+        }
+    }
+
+    /// Collects the wanted frames of one Cluster and returns the offset just past it.
+    private func parseCluster(_ cluster: EBMLReader.Element, reader base: EBMLReader,
                               wanted: Set<UInt64>,
                               tracks: [UInt64: SubtitleTrack],
-                              into frames: inout [UInt64: [SubtitleFrame]]) throws {
+                              into frames: inout [UInt64: [SubtitleFrame]]) throws -> Int {
         var clusterTs: UInt64 = 0
-        let end = cluster.dataEnd ?? segmentEnd
-        var r = reader
+        let end = cluster.dataEnd.map { min($0, segmentEnd) } ?? segmentEnd
+        var r = base
         r.pos = cluster.dataOffset
 
         while r.pos < end {
             let save = r.pos
             let c: EBMLReader.Element
-            do { c = try r.readElementHeader() } catch { return }
-            if cluster.dataSize == nil, MKV.level1.contains(c.id) { r.pos = save; return }
-            guard let cend = c.dataEnd, cend <= reader.count else { return }
+            do { c = try r.readElementHeader() } catch { return end }
+            if cluster.dataSize == nil, MKV.level1.contains(c.id) { return save }
+            guard let cend = c.dataEnd, cend <= r.count else { return end }
 
             switch c.id {
             case MKV.clusterTimestamp:
@@ -315,6 +460,7 @@ final class MatroskaDemuxer {
             }
             r.pos = cend
         }
+        return end
     }
 
     private func parseBlock(_ b: EBMLReader.Element, in base: EBMLReader, clusterTs: UInt64,

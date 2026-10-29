@@ -1,22 +1,126 @@
 import Foundation
+import IOKit
 
-/// Minimal EBML reader over a memory-mapped file.
-struct EBMLReader {
-    let data: Data
-    var pos: Int = 0
+/// An open MKV file read with `pread`. Shared by every reader (and thread) over the same file.
+final class MKVFile {
+    let fd: Int32
+    let size: Int
+    /// True when the file sits on a spinning disk: there, skipping ahead in small reads and
+    /// reading from several places at once is slower than streaming the whole file.
+    let isRotational: Bool
+    /// Set when a read came back short or failed before the end of the file.
+    var failed = false
 
     init(url: URL) throws {
-        data = try Data(contentsOf: url, options: [.alwaysMapped])
+        fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else { throw CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: url.path]) }
+        var st = stat()
+        guard fstat(fd, &st) == 0 else { close(fd); throw CocoaError(.fileReadUnknown) }
+        size = Int(st.st_size)
+        // We read most of the file once; keeping it out of the page cache spares the user's other apps.
+        _ = fcntl(fd, F_NOCACHE, 1)
+        isRotational = MKVFile.onRotationalDisk(fd: fd)
     }
 
-    var count: Int { data.count }
+    deinit { close(fd) }
+
+    /// Reads `length` bytes at `offset` into `buffer`; returns the number read (short at EOF).
+    func read(into buffer: UnsafeMutableRawPointer, offset: Int, length: Int) -> Int {
+        var done = 0
+        while done < length {
+            let n = pread(fd, buffer + done, length - done, off_t(offset + done))
+            if n > 0 { done += n } else if n < 0 && errno == EINTR { continue } else { break }
+        }
+        return done
+    }
+
+    /// Looks up the disk behind the file in IOKit. Unknown local disks count as rotational
+    /// (the safe choice); network volumes do not, since parallel small reads hide their latency.
+    private static func onRotationalDisk(fd: Int32) -> Bool {
+        var fs = statfs()
+        guard fstatfs(fd, &fs) == 0 else { return true }
+        let from = withUnsafeBytes(of: fs.f_mntfromname) { String(cString: $0.bindMemory(to: CChar.self).baseAddress!) }
+        guard from.hasPrefix("/dev/") else { return false }
+        let bsd = String(from.dropFirst("/dev/".count))
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOBSDNameMatching(kIOMainPortDefault, 0, bsd))
+        guard service != 0 else { return true }
+        defer { IOObjectRelease(service) }
+        let found = IORegistryEntrySearchCFProperty(service, kIOServicePlane, "Device Characteristics" as CFString, nil,
+                                                    IOOptionBits(kIORegistryIterateRecursively | kIORegistryIterateParents))
+        guard let chars = found as? [String: Any], let medium = chars["Medium Type"] as? String else { return true }
+        return medium != "Solid State"
+    }
+}
+
+/// Minimal EBML reader over an `MKVFile`. It keeps one window of the file in memory and refills
+/// it with a single `pread` when a read falls outside it, so walking from block header to block
+/// header only reads the bytes around the headers, never the video in between.
+/// Copies share the window (it is a class), so a reader and its copies must stay on one thread.
+struct EBMLReader {
+    let file: MKVFile
+    private let window: Window
+    var pos: Int = 0
+
+    final class Window {
+        let capacity: Int
+        let buffer: UnsafeMutableRawPointer
+        var start = 0
+        var length = 0
+        init(capacity: Int) {
+            self.capacity = capacity
+            buffer = UnsafeMutableRawPointer.allocate(byteCount: capacity, alignment: 4096)
+        }
+        deinit { buffer.deallocate() }
+    }
+
+    init(url: URL) throws {
+        try self.init(file: MKVFile(url: url))
+    }
+
+    init(file: MKVFile, windowSize: Int = 64 * 1024) {
+        self.file = file
+        window = Window(capacity: windowSize)
+    }
+
+    var count: Int { file.size }
 
     @inline(__always)
-    func byte(at i: Int) -> UInt8 { data[data.startIndex + i] }
+    func byte(at i: Int) -> UInt8 {
+        let w = window
+        if i < w.start || i >= w.start + w.length { fill(at: i) }
+        return w.buffer.load(fromByteOffset: i - w.start, as: UInt8.self)
+    }
+
+    private func fill(at i: Int) {
+        let w = window
+        let start = i & ~4095   // page-aligned reads
+        w.start = start
+        w.length = file.read(into: w.buffer, offset: start, length: min(w.capacity, max(0, count - start)))
+        if i >= w.start + w.length {
+            // I/O error (a disk unplugged mid-read): hand back zeros, which stop the parse at the
+            // next element header, and let readFrames report the failure.
+            file.failed = true
+            w.length = min(w.capacity, max(i - start + 1, 0))
+            memset(w.buffer, 0, w.length)
+        }
+    }
 
     func slice(_ offset: Int, _ length: Int) -> Data {
-        let s = data.startIndex + offset
-        return data.subdata(in: s ..< s + length)
+        guard length > 0 else { return Data() }
+        let w = window
+        if offset >= w.start, offset + length <= w.start + w.length {
+            return Data(bytes: w.buffer + (offset - w.start), count: length)
+        }
+        if length <= w.capacity / 2 {
+            fill(at: offset)
+            if offset + length <= w.start + w.length {
+                return Data(bytes: w.buffer + (offset - w.start), count: length)
+            }
+        }
+        var d = Data(count: length)
+        let n = d.withUnsafeMutableBytes { file.read(into: $0.baseAddress!, offset: offset, length: length) }
+        if n < length { d.count = max(0, n); file.failed = true }
+        return d
     }
 
     struct Element {
@@ -28,9 +132,10 @@ struct EBMLReader {
     }
 
     enum Failure: Error, LocalizedError {
-        case truncated, badVInt, notMatroska
+        case truncated, badVInt, notMatroska, readError
         var errorDescription: String? {
             switch self {
+            case .readError: return "could not read the file (was the disk disconnected?)"
             case .truncated: return "unexpected end of file"
             case .badVInt: return "corrupt EBML variable-length integer"
             case .notMatroska: return "not a Matroska (EBML) file"
@@ -127,6 +232,12 @@ enum MKV {
     static let block: UInt32 = 0xA1
     static let blockDuration: UInt32 = 0x9B
     static let cues: UInt32 = 0x1C53BB6B
+    static let seek: UInt32 = 0x4DBB
+    static let seekID: UInt32 = 0x53AB
+    static let seekPosition: UInt32 = 0x53AC
+    static let cuePoint: UInt32 = 0xBB
+    static let cueTrackPositions: UInt32 = 0xB7
+    static let cueClusterPosition: UInt32 = 0xF1
     static let tags: UInt32 = 0x1254C367
     static let chapters: UInt32 = 0x1043A770
     static let attachments: UInt32 = 0x1941A469
