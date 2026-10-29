@@ -1,0 +1,36 @@
+# XcodeGen spec. Run `xcodegen generate` (or ./build.sh) to produce ExtractSubtitles.xcodeproj.
+name: ExtractSubtitles
+options:
+  bundleIdPrefix: com.avandeputte
+  deploymentTarget:
+    macOS: "13.0"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
+    CODE_SIGN_STYLE: Automatic
+targets:
+  ExtractSubtitles:
+    type: application
+    platform: macOS
+    dependencies:
+      - sdk: Vision.framework
+    sources:
+      - path: Sources/ExtractSubtitles
+      - path: Resources/Assets.xcassets
+    settings:
+      base:
+        PRODUCT_NAME: "Extract Subtitles"
+        # Use our hand-written Info.plist / entitlements verbatim (XcodeGen's info:/entitlements: keys would regenerate them)
+        INFOPLIST_FILE: Resources/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: Resources/ExtractSubtitles.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: com.avandeputte.ExtractSubtitles
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_HARDENED_RUNTIME: YES
+        COMBINE_HIDPI_IMAGES: YES
+        SWIFT_STRICT_CONCURRENCY: minimal

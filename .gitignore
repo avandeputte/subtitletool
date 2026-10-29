@@ -1,0 +1,5 @@
+ExtractSubtitles.xcodeproj/
+build/
+DerivedData/
+.DS_Store
+*.xcuserstate
