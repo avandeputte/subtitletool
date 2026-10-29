@@ -1,4 +1,12 @@
-# Release 5 – IMDb picker, MP4 output, AC-3 copies (integration notes)
+# Release 5 – IMDb picker, MP4 output via ffmpeg (integration notes)
+
+**Superseded in part (2026-10-29):** Alex asked why a custom MP4 writer was needed when HandBrake does it all with
+ffmpeg. The muxer, codec parsers and VideoToolbox pipeline were therefore removed and `VideoConverter.swift` now
+drives ffmpeg (`hevc_videotoolbox`, `-c:a copy`, AC-3 copies, `overlay` burn-in of forced PGS, `mov_text`
+subtitles, chapters). Deleted: `Matroska/MP4Writer.swift`, `Matroska/AudioPackets.swift`, `Matroska/MP4Extras.swift`,
+`Matroska/MatroskaStream.swift`, `AC3Transcoder.swift`, `SubtitleBurner.swift`. Kept: `SubtitleTrackNames.swift`
+(`TimedText.describe/trackName`). The rest of this file describes the earlier design where it mentions those files.
+
 
 R4 (H.265, content-aware naming, OCR fixes) was never compiled on the Mac; R5 builds on it and replaces its
 Matroska output with MP4. Neither has been through a Swift compiler yet: expect a few trivial complaints.

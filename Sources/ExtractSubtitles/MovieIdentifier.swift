@@ -26,6 +26,8 @@ struct MovieIdentity: Equatable, Identifiable, Hashable {
     var label: String { "\(title) (\(year.map(String.init) ?? "no year"))" }
 
     var isSeries: Bool { kind.lowercased().contains("series") || kind.lowercased().contains("episode") }
+    /// A theatrical / feature film, as opposed to a video, TV movie, short or series.
+    var isFeature: Bool { kind.lowercased() == "feature" || kind.lowercased() == "movie" }
 
     static func == (lhs: MovieIdentity, rhs: MovieIdentity) -> Bool { lhs.imdbID == rhs.imdbID }
     func hash(into hasher: inout Hasher) { hasher.combine(imdbID) }
@@ -240,6 +242,7 @@ enum IMDbLookup {
             }
             if m.year == nil { s -= 10 }
             if m.isSeries { s -= 15 }
+            if !m.isFeature { s -= 5 }
             return s
         }
         let ranked = candidates.enumerated().sorted { a, b in
@@ -251,7 +254,12 @@ enum IMDbLookup {
         if let y = guess.year {
             let strong = exact.filter { yearMatches($0, y) }
             if strong.count == 1, strong[0].year != nil { return .confident(strong[0], candidates: ranked) }
-            if strong.count > 1 { return .ambiguous(ranked, reason: "Several titles called \"\(guess.title)\" match \(y).") }
+            if strong.count > 1 {
+                // "Batman (1989)" the feature vs "Batman (1989)" the video: one feature film wins.
+                let features = strong.filter { $0.isFeature }
+                if features.count == 1 { return .confident(features[0], candidates: ranked) }
+                return .ambiguous(ranked, reason: "Several titles called \"\(guess.title)\" match \(y).")
+            }
             if exact.isEmpty { return .ambiguous(ranked, reason: "No IMDb title is called exactly \"\(guess.title)\".") }
             return .ambiguous(ranked, reason: "\"\(guess.title)\" was found, but not from \(y).")
         }
@@ -262,7 +270,11 @@ enum IMDbLookup {
             if exact.count == 1 { return .confident(exactWithYear[0], candidates: ranked) }
             return .ambiguous(ranked, reason: "More than one IMDb entry is called \"\(guess.title)\".")
         }
-        if exactWithYear.count > 1 { return .ambiguous(ranked, reason: "Several films are called \"\(guess.title)\"; the file name has no year.") }
+        if exactWithYear.count > 1 {
+            let features = exactWithYear.filter { $0.isFeature }
+            if features.count == 1 { return .confident(features[0], candidates: ranked) }
+            return .ambiguous(ranked, reason: "Several films are called \"\(guess.title)\"; the file name has no year.")
+        }
         if exact.count == 1 { return .ambiguous(ranked, reason: "\"\(guess.title)\" was found, but without a release year.") }
         return .ambiguous(ranked, reason: guess.title.isEmpty ? "The file name has no usable title." : "No IMDb title is called exactly \"\(guess.title)\".")
     }
