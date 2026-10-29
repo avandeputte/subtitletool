@@ -3,6 +3,7 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject private var runner: JobRunner
+    @EnvironmentObject private var resolver: MovieResolver
     @State private var isTargeted = false
 
     var body: some View {
@@ -29,6 +30,9 @@ struct ContentView: View {
         }
         .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
             handleDrop(providers)
+        }
+        .sheet(item: $resolver.prompt) { prompt in
+            IMDbPickerSheet(prompt: prompt)
         }
         .overlay {
             if isTargeted {
@@ -66,20 +70,22 @@ struct ContentView: View {
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         var found = false
         let group = DispatchGroup()
-        var urls: [URL] = []
+        final class Collected { var urls: [URL] = [] }
+        let collected = Collected()
         for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
             found = true
             group.enter()
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
                 defer { group.leave() }
                 if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
-                    urls.append(url)
+                    collected.urls.append(url)
                 } else if let url = item as? URL {
-                    urls.append(url)
+                    collected.urls.append(url)
                 }
             }
         }
-        group.notify(queue: .main) { runner.enqueue(urls) }
+        let runner = self.runner
+        group.notify(queue: .main) { Task { @MainActor in runner.enqueue(collected.urls) } }
         return found
     }
 }
@@ -94,6 +100,11 @@ struct JobRow: View {
                 Label(job.message, systemImage: "exclamationmark.triangle")
                     .font(.callout)
                     .foregroundStyle(.orange)
+            }
+            if !job.conversionSummary.isEmpty {
+                Label(job.conversionSummary, systemImage: "film")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
             ForEach(job.tracks) { track in
                 TrackRow(result: track)
@@ -114,9 +125,17 @@ struct JobRow: View {
                 Spacer()
                 if case .done = job.state, let folder = job.outputFolder {
                     Button("Show in Finder") {
-                        NSWorkspace.shared.activateFileViewerSelecting([folder])
+                        NSWorkspace.shared.activateFileViewerSelecting([job.conversionOutput ?? folder])
                     }
                     .buttonStyle(.link)
+                } else if case .encoding = job.state {
+                    ProgressView(value: job.progress).frame(width: 120)
+                    Button {
+                        job.cancelConversion()
+                    } label: { Image(systemName: "xmark.circle") }
+                    .buttonStyle(.borderless)
+                    .disabled(job.cancelRequested)
+                    .help("Cancel the H.265 conversion")
                 } else if isWorking {
                     ProgressView(value: job.progress).frame(width: 120)
                 }
@@ -126,7 +145,7 @@ struct JobRow: View {
 
     private var isWorking: Bool {
         switch job.state {
-        case .scanning, .extracting, .converting: return true
+        case .identifying, .scanning, .extracting, .converting, .encoding: return true
         default: return false
         }
     }
@@ -135,7 +154,8 @@ struct JobRow: View {
         Group {
             switch job.state {
             case .queued: Image(systemName: "clock")
-            case .scanning, .extracting, .converting: ProgressView().controlSize(.small)
+            case .identifying: Image(systemName: "magnifyingglass")
+            case .scanning, .extracting, .converting, .encoding: ProgressView().controlSize(.small)
             case .done:
                 Image(systemName: job.hasFailures ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
                     .foregroundStyle(job.hasFailures ? .orange : .green)
@@ -148,13 +168,32 @@ struct JobRow: View {
     private var statusText: String {
         switch job.state {
         case .queued: return "Waiting"
+        case .identifying: return job.message.isEmpty ? "Looking the film up on IMDb…" : job.message
         case .scanning: return "Reading file…"
         case .extracting: return "Extracting subtitle tracks…"
         case .converting: return "Converting to SRT…"
+        case .encoding:
+            var s = job.cancelRequested ? "Cancelling…" : "Converting to H.265 (MP4)…"
+            if let c = job.conversion {
+                s += String(format: " %.0f%%", c.fraction * 100)
+                if c.fps > 0 { s += String(format: " · %.1f fps", c.fps) }
+                if let eta = c.etaSeconds, eta > 0 { s += " · \(JobRow.etaText(eta)) left" }
+            }
+            return s
         case .done:
+            if job.kind == .convert {
+                return "Converted → \(job.conversionOutput?.lastPathComponent ?? "")"
+            }
             return "\(job.tracks.count) track(s), \(job.srtCount) SRT file(s) → \(job.outputFolder?.lastPathComponent ?? "")"
         case .failed(let why): return why
         }
+    }
+
+    static func etaText(_ seconds: Double) -> String {
+        let s = Int(seconds.rounded())
+        if s < 60 { return "\(s) s" }
+        if s < 3600 { return "\(s / 60) min" }
+        return String(format: "%d h %02d min", s / 3600, (s % 3600) / 60)
     }
 }
 
@@ -219,12 +258,15 @@ struct TrackRow: View {
 struct SettingsView: View {
     @AppStorage(ConversionMode.storageKey) private var conversionModeRaw = ConversionMode.local.rawValue
     @AppStorage(JobRunner.renameKey) private var renameFromIMDb = true
+    @AppStorage(JobRunner.convertKey) private var convertToH265 = false
+    @AppStorage(JobRunner.qualityKey) private var h265Quality = 0.85
+    @AppStorage(JobRunner.ac3CopyKey) private var addAC3Copies = true
 
     var body: some View {
         Form {
             Section("File naming") {
                 Toggle("Look the movie up on IMDb and rename to \"Movie Name (yyyy).mkv\"", isOn: $renameFromIMDb)
-                Text("The title and year are read from the file name (release tags are ignored) and matched on IMDb. The MKV, its subtitle folder and every subtitle file then use that name. If there is no confident match the original name is kept.")
+                Text("Rip names such as \"Cloud Atlas_t00.mkv\" or \"The.Matrix.1999.1080p.BluRay-GRP.mkv\" are cleaned up (MakeMKV suffixes, release tags) and matched on IMDb; the MKV, its subtitle folder and every subtitle file then use \"Cloud Atlas (2012)\". When several titles fit, the year disagrees or nothing matches exactly, a picker asks you to choose (or to keep the name). With several files queued, every lookup and question comes first, before any subtitle work starts.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text("Subtitle files are named <movie>.<language>[.<track name>][.forced][.sdh][.commentary].<ext>. The language tag keeps the region when the file gives one (fr-CA, fr-FR, pt-BR, es-419…), so two tracks of the same language stay apart.")
@@ -239,6 +281,20 @@ struct SettingsView: View {
                 }
                 .pickerStyle(.radioGroup)
                 Text("Everything runs on this Mac: ASS/SSA/WebVTT are converted directly, image subtitles (PGS) are rendered frame by frame and read with Apple Vision text recognition in the track's language.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section("Video conversion") {
+                Toggle("Convert to H.265 (MP4) after extracting", isOn: $convertToH265)
+                HStack {
+                    Text("Quality")
+                    Slider(value: $h265Quality, in: 0.5 ... 1.0, step: 0.05)
+                    Text(String(format: "%.2f", h265Quality))
+                        .monospacedDigit()
+                        .frame(width: 40, alignment: .trailing)
+                }
+                Toggle("Add an AC-3 copy of every DTS / TrueHD track", isOn: $addAC3Copies)
+                Text("Re-encodes the video with the Mac's HEVC hardware encoder at the same resolution and frame rate (hvc1, so QuickTime and Apple TV play it), keeps every audio track untouched — AAC, AC-3, E-AC-3, DTS, DTS-HD, TrueHD, FLAC, Opus — adds text subtitle tracks and chapters, and burns the forced subtitle track (if any) into the picture. DTS and TrueHD cannot be decoded by Apple players, so each such track also gets an AC-3 5.1 copy with the same language (made with ffmpeg, which must be installed; the copy is skipped otherwise). The result is <movie>.mp4 next to the original, which is never modified. Also available on its own: right-click an MKV in Finder → Services › Convert to H.265, or File › Convert to H.265…")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

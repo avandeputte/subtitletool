@@ -138,6 +138,92 @@ enum Naming {
         return base
     }
 
+    /// A track's final name, decided from metadata *and* content.
+    struct Plan {
+        /// Base file name without extension; nil when the track is a byte-identical copy of `duplicateOf`.
+        var base: String?
+        var duplicateOf: UInt64?
+        var tag: String
+        var forced: Bool
+        var sdh: Bool
+    }
+
+    private static func baseLanguage(_ tag: String) -> String {
+        tag.split(separator: "-").first.map(String.init) ?? tag
+    }
+
+    /// Names every track as `<movie>.<lang>[.<name>][.forced][.sdh][.commentary]`, using what the
+    /// content says when the metadata is silent (typical for MakeMKV rips):
+    ///  - a stream byte-identical to an earlier track is skipped (`duplicateOf`),
+    ///  - `.forced` when the flag is set, when every PGS cue is flagged forced in the stream, or when the
+    ///    track has under 10% of the cues of the fullest track in the same language,
+    ///  - `.sdh` when the flag/name says so or more than 5% of the cues carry `[sound]` / `NAME:` captions,
+    ///  - Chinese gets `zh-Hans` / `zh-Hant` from the characters in the text,
+    ///  - names that still collide get the track number appended (`zh-Hant.10`, `zh-Hant.12`).
+    /// Region subtags (fr-CA / fr-FR) come only from the IETF tag or the track name, never from guessing.
+    static func plan(movie: String, tracks: [SubtitleTrack], analyses: [UInt64: TrackAnalysis]) -> [UInt64: Plan] {
+        var plans: [UInt64: Plan] = [:]
+        var seenHashes: [String: UInt64] = [:]
+
+        // The fullest non-forced track per language, to spot "signs only" tracks by cue count.
+        var fullCues: [String: Int] = [:]
+        for t in tracks {
+            let a = analyses[t.number]
+            let flaggedForced = t.isForced || t.name.lowercased().contains("forced") || (a?.allCuesForced ?? false)
+            if !flaggedForced {
+                let base = baseLanguage(languageTag(for: t))
+                fullCues[base] = max(fullCues[base] ?? 0, a?.cueCount ?? 0)
+            }
+        }
+
+        for t in tracks {
+            let a = analyses[t.number] ?? TrackAnalysis()
+            var tag = languageTag(for: t)
+            if !a.contentHash.isEmpty, let first = seenHashes[a.contentHash] {
+                plans[t.number] = Plan(base: nil, duplicateOf: first, tag: tag, forced: false, sdh: false)
+                continue
+            }
+            if !a.contentHash.isEmpty { seenHashes[a.contentHash] = t.number }
+
+            let base = baseLanguage(tag)
+            if base == "zh", !tag.contains("-"), let script = a.chineseScript { tag = "zh-\(script)" }
+
+            let lowerName = t.name.lowercased()
+            var forced = t.isForced || lowerName.contains("forced") || a.allCuesForced
+            if !forced, let full = fullCues[base], full >= 50, a.cueCount > 0, Double(a.cueCount) < Double(full) * 0.10 {
+                forced = true
+            }
+            let sdh = isSDH(t) || a.sdhRatio > 0.05
+
+            var parts = [safe(movie), tag]
+            if !isRedundantName(t.name, tag: tag) { parts.append(safe(t.name)) }
+            if forced, !lowerName.contains("forced") { parts.append("forced") }
+            if sdh, !lowerName.contains("sdh"), !lowerName.contains("hearing") { parts.append("sdh") }
+            if t.isCommentary, !lowerName.contains("commentar") { parts.append("commentary") }
+            plans[t.number] = Plan(base: parts.joined(separator: "."), duplicateOf: nil, tag: tag, forced: forced, sdh: sdh)
+        }
+
+        // Names that still collide get the track number so both files survive.
+        var byName: [String: [UInt64]] = [:]
+        for (n, p) in plans { if let b = p.base { byName[b, default: []].append(n) } }
+        for (b, numbers) in byName where numbers.count > 1 {
+            for n in numbers { plans[n]?.base = "\(b).\(n)" }
+        }
+        return plans
+    }
+
+    /// Short summary of a content analysis for the log: " cues=16 pgs-forced=16 sdh=18%".
+    static func describe(_ analysis: TrackAnalysis?) -> String {
+        guard let a = analysis else { return "" }
+        var bits: [String] = [" cues=\(a.cueCount)"]
+        if a.pgsForcedCues > 0 { bits.append("pgs-forced=\(a.pgsForcedCues)") }
+        if a.text != nil {
+            bits.append("sdh=\(Int((a.sdhRatio * 100).rounded()))%")
+            if let s = a.chineseScript { bits.append("script=\(s)") }
+        }
+        return bits.joined(separator: " ")
+    }
+
     /// One-line description of what makes a track distinct, for the window and the CLI log.
     static func describe(_ track: SubtitleTrack) -> String {
         var bits: [String] = [languageTag(for: track)]

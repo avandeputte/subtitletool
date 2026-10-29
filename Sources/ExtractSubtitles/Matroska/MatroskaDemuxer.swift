@@ -52,7 +52,7 @@ enum SubtitleKind {
         }
     }
 
-    /// Text formats that subtitletools.com can turn into SRT.
+    /// Text formats (converted to SRT locally by stripping styling).
     var isTextBased: Bool {
         switch self {
         case .srt, .ass, .ssa, .webvtt: return true
