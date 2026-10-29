@@ -112,6 +112,8 @@ enum CommandLineMode {
     static func runIfRequested() {
         let args = CommandLine.arguments.dropFirst()
         guard args.contains("--cli") else { return }
+        // Line-buffer stdout so progress shows up when the output is redirected to a log file.
+        setvbuf(stdout, nil, _IOLBF, 0)
         // "--quality 0.9" takes a value; everything else that does not start with "--" is a file.
         var files: [URL] = []
         var quality = UserDefaults.standard.object(forKey: JobRunner.qualityKey) as? Double ?? 0.85
