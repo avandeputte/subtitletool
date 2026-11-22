@@ -52,14 +52,16 @@ final class TrackResult: ObservableObject, Identifiable {
 /// One MKV being processed.
 @MainActor
 final class Job: ObservableObject, Identifiable {
-    /// What the job does: extract subtitles (then convert to H.265 when the setting is on), or convert only.
-    enum Kind { case extract, convert }
+    /// What the job does: extract subtitles (then convert to MP4 when the setting is on), convert to
+    /// H.265 only, or remux to MP4 only (video copied).
+    enum Kind { case extract, convert, remux }
 
-    /// Live progress of the H.265 conversion.
+    /// Live progress of the MP4 conversion.
     struct ConversionStatus: Equatable {
         var fraction: Double
         var fps: Double
         var etaSeconds: Double?
+        var remux: Bool = false
     }
 
     let id = UUID()
@@ -124,11 +126,14 @@ final class JobRunner: ObservableObject {
     @AppStorage(JobRunner.convertKey) var convertToH265 = false
     @AppStorage(JobRunner.qualityKey) var h265Quality = 0.85
     @AppStorage(JobRunner.ac3CopyKey) var addAC3Copies = true
+    /// After extracting: copy the video into the MP4 instead of re-encoding it as H.265.
+    @AppStorage(JobRunner.remuxKey) var remuxVideo = false
 
     nonisolated static let renameKey = "renameFromIMDb"
     nonisolated static let convertKey = "convertToH265"
     nonisolated static let qualityKey = "h265Quality"
     nonisolated static let ac3CopyKey = "addAC3Copies"
+    nonisolated static let remuxKey = "remuxVideo"
     var conversionMode: ConversionMode { ConversionMode.from(stored: conversionModeRaw) }
 
     let resolver = MovieResolver()
@@ -213,10 +218,12 @@ final class JobRunner: ObservableObject {
                 case .extract:
                     await SubtitleExtractor.process(job: job, mode: conversionMode, log: nil)
                     if convertToH265, job.allowsConversion {
-                        await VideoConversionStep.run(job: job, quality: h265Quality, ac3Copies: addAC3Copies, log: nil)
+                        await VideoConversionStep.run(job: job, quality: h265Quality, ac3Copies: addAC3Copies, remux: remuxVideo, log: nil)
                     }
                 case .convert:
                     await VideoConversionStep.run(job: job, quality: h265Quality, ac3Copies: addAC3Copies, log: nil)
+                case .remux:
+                    await VideoConversionStep.run(job: job, quality: h265Quality, ac3Copies: addAC3Copies, remux: true, log: nil)
                 }
                 notify(job)
             }

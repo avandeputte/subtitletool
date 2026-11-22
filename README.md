@@ -50,7 +50,14 @@ language correction, languages picked from the track's language tag):
   dashes (`-x` → `- x`), ellipses (`..`, `....`, `…` → `...`), stray capitals inside words (`BOo` → `Boo`),
   `''`/curly quotes and spacing around punctuation, leaving `<i>` tags untouched.
 
-## Convert to H.265 (MP4)
+## Convert to H.265 (MP4), or remux to MP4
+
+**Remux** (Finder → Services → Remux to MP4, File › Remux to MP4…, `--cli --remux`, or Settings › Video ›
+"Keep the video as it is" for the after-extraction step) copies the H.264/HEVC video stream into an `.mp4` in
+seconds, with the same audio, AC-3 copy, subtitle and chapter handling as below. Nothing can be burned in without
+re-encoding, so the forced subtitles are carried as a *forced* text track when they were extracted (OCR'd) first;
+VC-1 / MPEG-2 video cannot be remuxed into an MP4.
+
 
 Right-click an `.mkv` in Finder → **Services → Convert to H.265** (or File › Convert to H.265…, or
 `--cli --h265`), or switch on *Settings › Video conversion › Convert to H.265 (MP4) after extracting* to run it

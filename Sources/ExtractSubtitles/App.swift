@@ -25,6 +25,8 @@ struct ExtractSubtitlesApp: App {
                     .keyboardShortcut("o")
                 Button("Convert to H.265…") { appDelegate.runner.openPanel(kind: .convert) }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
+                Button("Remux to MP4…") { appDelegate.runner.openPanel(kind: .remux) }
+                    .keyboardShortcut("o", modifiers: [.command, .option])
             }
         }
 
@@ -66,6 +68,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Queues convert-only jobs (used by the "Convert to H.265" service).
     func convertToH265(_ urls: [URL]) { runner.enqueue(urls, kind: .convert) }
+    /// Queues remux-only jobs (used by the "Remux to MP4" service).
+    func remuxToMP4(_ urls: [URL]) { runner.enqueue(urls, kind: .remux) }
 }
 
 /// Receives the Finder "Extract Subtitles" service (declared under NSServices in Info.plist).
@@ -101,6 +105,21 @@ final class ServiceProvider: NSObject {
             self.runner.enqueue(urls, kind: .convert)
         }
     }
+
+    /// Finder "Remux to MP4" service: copies the video into an MP4, no re-encode, no subtitle extraction.
+    @objc(remuxToMP4:userData:error:)
+    func remuxToMP4(_ pboard: NSPasteboard, userData: String, error: AutoreleasingUnsafeMutablePointer<NSString>) {
+        let urls = (pboard.readObjects(forClasses: [NSURL.self],
+                                       options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+        guard !urls.isEmpty else {
+            error.pointee = "No files were passed to Remux to MP4." as NSString
+            return
+        }
+        Task { @MainActor in
+            NSApp.activate(ignoringOtherApps: true)
+            self.runner.enqueue(urls, kind: .remux)
+        }
+    }
 }
 
 /// `Extract Subtitles.app/Contents/MacOS/Extract Subtitles --cli [--list] [--no-convert|--local] [--no-rename] [--h265] [--quality 0.9] [--no-ac3] file.mkv …`
@@ -132,7 +151,8 @@ enum CommandLineMode {
             }
             if !a.hasPrefix("--") { files.append(URL(fileURLWithPath: a)) }
         }
-        let convertOnly = args.contains("--h265")
+        let remuxOnly = args.contains("--remux")
+        let convertOnly = args.contains("--h265") || remuxOnly
         if args.contains("--list") {
             // Just print the subtitle tracks and the names they would get; writes nothing.
             var failures = 0
@@ -188,7 +208,7 @@ enum CommandLineMode {
             exit(failures == 0 ? 0 : 1)
         }
         guard !files.isEmpty else {
-            FileHandle.standardError.write(Data("usage: ExtractSubtitles --cli [--list] [--no-convert|--local] [--no-rename|--rename] [--h265] [--quality 0.9] [--no-ac3] file.mkv …\n".utf8))
+            FileHandle.standardError.write(Data("usage: ExtractSubtitles --cli [--list] [--no-convert|--local] [--no-rename|--rename] [--h265|--remux] [--quality 0.9] [--no-ac3] file.mkv …\n".utf8))
             exit(2)
         }
         var mode = ConversionMode.from(stored: UserDefaults.standard.string(forKey: ConversionMode.storageKey))
@@ -204,12 +224,15 @@ enum CommandLineMode {
         Task.detached {
             var failures = 0
             let convertAfter = UserDefaults.standard.bool(forKey: JobRunner.convertKey)
-            if convertOnly {
+            let remuxAfter = UserDefaults.standard.bool(forKey: JobRunner.remuxKey)
+            if remuxOnly {
+                print("remux to MP4 only (video copied); IMDb rename: \(rename ? "on" : "off"); AC-3 copies of DTS/TrueHD: \(ac3Copies ? "on" : "off")")
+            } else if convertOnly {
                 print("convert to H.265 (MP4) only; quality \(quality); IMDb rename: \(rename ? "on" : "off"); AC-3 copies of DTS/TrueHD: \(ac3Copies ? "on" : "off")")
             } else {
-                print("conversion mode: \(mode.rawValue); IMDb rename: \(rename ? "on" : "off"); H.265 (MP4) after extracting: \(convertAfter ? "on (quality \(quality), AC-3 copies \(ac3Copies ? "on" : "off"))" : "off")")
+                print("conversion mode: \(mode.rawValue); IMDb rename: \(rename ? "on" : "off"); MP4 after extracting: \(convertAfter ? (remuxAfter ? "on (remux, video copied, AC-3 copies \(ac3Copies ? "on" : "off"))" : "on (H.265, quality \(quality), AC-3 copies \(ac3Copies ? "on" : "off"))") : "off")")
             }
-            let jobs: [Job] = await MainActor.run { files.map { Job(url: $0, kind: convertOnly ? .convert : .extract) } }
+            let jobs: [Job] = await MainActor.run { files.map { Job(url: $0, kind: remuxOnly ? .remux : (convertOnly ? .convert : .extract)) } }
 
             // Phase 1: IMDb for every file first (questions on the terminal when there is one).
             if rename {
@@ -225,7 +248,7 @@ enum CommandLineMode {
             // Phase 2: the work.
             for job in jobs {
                 if convertOnly {
-                    await VideoConversionStep.run(job: job, quality: quality, ac3Copies: ac3Copies) { line in
+                    await VideoConversionStep.run(job: job, quality: quality, ac3Copies: ac3Copies, remux: remuxOnly) { line in
                         print(line)
                     }
                 } else {
@@ -233,7 +256,7 @@ enum CommandLineMode {
                         print(line)
                     }
                     if convertAfter, await job.allowsConversion {
-                        await VideoConversionStep.run(job: job, quality: quality, ac3Copies: ac3Copies) { line in
+                        await VideoConversionStep.run(job: job, quality: quality, ac3Copies: ac3Copies, remux: remuxAfter) { line in
                             print(line)
                         }
                     }

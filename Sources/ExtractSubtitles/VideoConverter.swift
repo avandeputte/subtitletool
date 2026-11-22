@@ -45,6 +45,9 @@ final class VideoConverter {
         /// Extracted `<movie>.<lang>.forced.sup` files. Burned in when the MKV itself flags no forced track
         /// (Blu-ray rips usually mark "forced" only inside the PGS data, which TrackAnalysis reads).
         var forcedSupFiles: [URL] = []
+        /// Remux only: copy the video stream as it is (no re-encode, no burn-in); forced subtitles become a
+        /// forced text track when an extracted SRT exists.
+        var remux: Bool = false
     }
 
     struct Progress {
@@ -142,6 +145,7 @@ final class VideoConverter {
         case ffmpegMissing
         case probeFailed(String)
         case noVideoTrack
+        case cannotRemux(String)
         case ffmpegFailed(Int32, String)
         case notEnoughSpace(neededGB: Double, freeGB: Double)
         case outputTooLarge(projectedGB: Double, sourceGB: Double)
@@ -156,6 +160,7 @@ final class VideoConverter {
             case .ffmpegMissing: return "ffmpeg was not found (brew install ffmpeg, or put ffmpeg and ffprobe in the app's Contents/Helpers)"
             case .probeFailed(let m): return "ffprobe could not read the file: \(m)"
             case .noVideoTrack: return "the file has no video track"
+            case .cannotRemux(let c): return "video codec \(c) cannot be put into an MP4 without re-encoding (use Convert to H.265)"
             case .ffmpegFailed(let code, let msg): return "ffmpeg exited with \(code)\(msg.isEmpty ? "" : ": \(msg)")"
             case .cancelled: return "cancelled"
             }
@@ -215,6 +220,10 @@ final class VideoConverter {
         }
         log("  source: \(probe.streams.count) streams, \(String(format: "%.1f", probe.duration / 60)) min, \(probe.chapters) chapter(s)")
         log("  video: \(video.describe)\(video.isHDR ? " HDR (\(video.colorTransfer))" : "")")
+        if options.remux {
+            guard ["hevc", "h264", "av1", "vp9", "mpeg4"].contains(video.codecName) else { throw Failure.cannotRemux(video.codecName) }
+            log("  remux: the video is copied as it is (no re-encode)")
+        }
 
         let finalURL = VideoConverter.outputURL(for: source)
         let tempURL = finalURL.deletingPathExtension().appendingPathExtension("part.mp4")
@@ -314,7 +323,16 @@ final class VideoConverter {
         let subs = probe.streams.filter { $0.codecType == "subtitle" }
 
         // Which subtitle track to burn in: a forced PGS track, preferring the default audio's language, then English.
-        if options.burnInSubtitles {
+        if options.remux {
+            let hasForcedSRT = options.extraSubtitleFiles.contains { TimedText.describe(fileName: $0.lastPathComponent, movie: title).forced }
+            if hasForcedSRT {
+                log("  forced subtitles: added as a forced text track (nothing is burned in when the video is copied)")
+            } else if subs.contains(where: { $0.isForced || $0.title.lowercased().contains("forced") }) || !options.forcedSupFiles.isEmpty {
+                let n = "the forced subtitle track is PGS and cannot be burned in or carried when the video is copied; extract subtitles first (the OCR'd forced .srt then becomes a forced track) or use Convert to H.265"
+                log("  \(n)")
+                notes.append(n)
+            }
+        } else if options.burnInSubtitles {
             let forced = subs.filter { $0.isForced || $0.title.lowercased().contains("forced") }
             let defaultAudio = audio.first(where: { $0.isDefault }) ?? audio.first
             func base(_ tag: String) -> String { Naming.shortCode(tag).split(separator: "-").first.map(String.init) ?? tag }
@@ -435,30 +453,36 @@ final class VideoConverter {
         } else {
             a += ["-map", "0:v:\(v.typeIndex)"]
         }
-        a += ["-c:v", "hevc_videotoolbox", "-tag:v", "hvc1", "-allow_sw", "1"]
         if !v.language.isEmpty { a += ["-metadata:s:v:0", "language=\(v.language)"] }
-        if v.isTenBit {
-            a += ["-profile:v", "main10", "-pix_fmt", "p010le"]
+        if options.remux {
+            // Stream copy; hvc1 (not hev1) so Apple players accept HEVC. H.264 gets avc1 by default.
+            a += ["-c:v", "copy"]
+            if v.codecName == "hevc" { a += ["-tag:v", "hvc1"] }
         } else {
-            a += ["-profile:v", "main", "-pix_fmt", "nv12"]
-        }
-        let pixels = Double(v.width * v.height)
-        let q = max(0.5, min(1.0, options.quality))
-        if bitrateMode {
-            let base = pixels >= 3_500_000 ? 30.0 : (pixels >= 1_500_000 ? 12.0 : 5.0)   // Mbit/s at quality 0.85
-            let mbps = base * max(0.4, q / 0.85)
-            a += ["-b:v", "\(Int(mbps * 1000))k"]
-        } else {
-            a += ["-q:v", "\(VideoConverter.videotoolboxQ(q))"]
-        }
-        // Hard ceiling on the video bitrate whatever the quality mode does: a Blu-ray's HEVC should never
-        // come out above its own bitrate. 4K: 30-50 Mbit/s, 1080p: 12-20, smaller: 5-8 (scaled by the slider).
-        let capBase = pixels >= 3_500_000 ? 50.0 : (pixels >= 1_500_000 ? 20.0 : 8.0)
-        let capMbps = capBase * (0.6 + 0.4 * (q - 0.5) / 0.5)
-        a += ["-maxrate", "\(Int(capMbps * 1000))k", "-bufsize", "\(Int(capMbps * 2000))k"]
-        for (flag, value) in [("-color_primaries", v.colorPrimaries), ("-color_trc", v.colorTransfer), ("-colorspace", v.colorSpace), ("-color_range", v.colorRange)]
-            where !value.isEmpty && value != "unknown" {
-            a += [flag, value]
+            a += ["-c:v", "hevc_videotoolbox", "-tag:v", "hvc1", "-allow_sw", "1"]
+            if v.isTenBit {
+                a += ["-profile:v", "main10", "-pix_fmt", "p010le"]
+            } else {
+                a += ["-profile:v", "main", "-pix_fmt", "nv12"]
+            }
+            let pixels = Double(v.width * v.height)
+            let q = max(0.5, min(1.0, options.quality))
+            if bitrateMode {
+                let base = pixels >= 3_500_000 ? 30.0 : (pixels >= 1_500_000 ? 12.0 : 5.0)   // Mbit/s at quality 0.85
+                let mbps = base * max(0.4, q / 0.85)
+                a += ["-b:v", "\(Int(mbps * 1000))k"]
+            } else {
+                a += ["-q:v", "\(VideoConverter.videotoolboxQ(q))"]
+            }
+            // Hard ceiling on the video bitrate whatever the quality mode does: a Blu-ray's HEVC should never
+            // come out above its own bitrate. 4K: 30-50 Mbit/s, 1080p: 12-20, smaller: 5-8 (scaled by the slider).
+            let capBase = pixels >= 3_500_000 ? 50.0 : (pixels >= 1_500_000 ? 20.0 : 8.0)
+            let capMbps = capBase * (0.6 + 0.4 * (q - 0.5) / 0.5)
+            a += ["-maxrate", "\(Int(capMbps * 1000))k", "-bufsize", "\(Int(capMbps * 2000))k"]
+            for (flag, value) in [("-color_primaries", v.colorPrimaries), ("-color_trc", v.colorTransfer), ("-colorspace", v.colorSpace), ("-color_range", v.colorRange)]
+                where !value.isEmpty && value != "unknown" {
+                a += [flag, value]
+            }
         }
 
         // Audio
@@ -534,7 +558,7 @@ final class VideoConverter {
                 // Size guard: after a minute of output, project the final size; stop when it beats the source.
                 if let self = self, outTime > 60, duration > 0, totalSize > 0, self.sourceSize > 0 {
                     let projected = Double(totalSize) / outTime * duration
-                    if projected > Double(self.sourceSize) * 1.2 {
+                    if projected > Double(self.sourceSize) * (self.options.remux ? 1.5 : 1.2) {
                         self.guardLock.lock()
                         if self.guardFailure == nil {
                             self.guardFailure = .outputTooLarge(projectedGB: projected / 1e9, sourceGB: Double(self.sourceSize) / 1e9)

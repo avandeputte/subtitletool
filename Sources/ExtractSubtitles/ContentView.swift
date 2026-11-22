@@ -173,7 +173,7 @@ struct JobRow: View {
         case .extracting: return "Extracting subtitle tracks…"
         case .converting: return "Converting to SRT…"
         case .encoding:
-            var s = job.cancelRequested ? "Cancelling…" : "Converting to H.265 (MP4)…"
+            var s = job.cancelRequested ? "Cancelling…" : ((job.conversion?.remux ?? false) ? "Remuxing to MP4…" : "Converting to H.265 (MP4)…")
             if let c = job.conversion {
                 s += String(format: " %.0f%%", c.fraction * 100)
                 if c.fps > 0 { s += String(format: " · %.1f fps", c.fps) }
@@ -261,6 +261,7 @@ struct SettingsView: View {
     @AppStorage(JobRunner.convertKey) private var convertToH265 = false
     @AppStorage(JobRunner.qualityKey) private var h265Quality = 0.85
     @AppStorage(JobRunner.ac3CopyKey) private var addAC3Copies = true
+    @AppStorage(JobRunner.remuxKey) private var remuxVideo = false
 
     var body: some View {
         Form {
@@ -285,16 +286,23 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
             Section("Video conversion") {
-                Toggle("Convert to H.265 (MP4) after extracting", isOn: $convertToH265)
-                HStack {
-                    Text("Quality")
-                    Slider(value: $h265Quality, in: 0.5 ... 1.0, step: 0.05)
-                    Text(String(format: "%.2f (ffmpeg q %d)", h265Quality, VideoConverter.videotoolboxQ(h265Quality)))
-                        .monospacedDigit()
-                        .frame(width: 40, alignment: .trailing)
+                Toggle("Convert to MP4 after extracting", isOn: $convertToH265)
+                Picker("Video", selection: $remuxVideo) {
+                    Text("Re-encode as H.265 (smaller file, takes a while)").tag(false)
+                    Text("Keep the video as it is (remux, fast, same size)").tag(true)
+                }
+                .pickerStyle(.radioGroup)
+                if !remuxVideo {
+                    HStack {
+                        Text("Quality")
+                        Slider(value: $h265Quality, in: 0.5 ... 1.0, step: 0.05)
+                        Text(String(format: "%.2f (ffmpeg q %d)", h265Quality, VideoConverter.videotoolboxQ(h265Quality)))
+                            .monospacedDigit()
+                            .frame(width: 110, alignment: .trailing)
+                    }
                 }
                 Toggle("Add an AC-3 copy of every DTS / TrueHD track", isOn: $addAC3Copies)
-                Text("Runs ffmpeg (Homebrew: brew install ffmpeg) the way HandBrake does: the video is re-encoded with the Mac's HEVC hardware encoder at the same resolution and frame rate (hvc1, so QuickTime and Apple TV play it), every audio track is copied untouched (AAC, AC-3, E-AC-3, DTS, DTS-HD, TrueHD, FLAC, Opus), text subtitles become subtitle tracks, chapters are kept, and the forced PGS subtitle track (if any) is burned into the picture. DTS and TrueHD cannot be decoded by Apple players, so each such track also gets an AC-3 5.1 copy with the same language, which is the track players start with. The result is <movie>.mp4 next to the original, which is never modified. Also available on its own: right-click an MKV in Finder → Services › Convert to H.265, or File › Convert to H.265…")
+                Text("Runs ffmpeg (Homebrew: brew install ffmpeg) the way HandBrake does. Re-encode: the video goes through the Mac's HEVC hardware encoder at the same resolution and frame rate (hvc1, so QuickTime and Apple TV play it) and the forced PGS subtitle track is burned into the picture. Remux: the H.264/HEVC video is copied as it is in seconds; nothing can be burned in, so forced subtitles are carried as a forced text track when they were extracted. In both cases every audio track is copied untouched (AAC, AC-3, E-AC-3, DTS, DTS-HD, TrueHD, FLAC, Opus), text subtitles become subtitle tracks, chapters are kept. DTS and TrueHD cannot be decoded by Apple players, so each such track also gets an AC-3 5.1 copy with the same language, which is the track players start with. The result is <movie>.mp4 next to the original, which is never modified. Also available on their own: right-click an MKV in Finder → Services › Convert to H.265 / Remux to MP4, or the File menu.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

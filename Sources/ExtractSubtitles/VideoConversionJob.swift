@@ -5,14 +5,18 @@ import Foundation
 /// already happened by now (MovieResolver), so the output name is final.
 enum VideoConversionStep {
 
-    static func run(job: Job, quality: Double, ac3Copies: Bool, log: ((String) -> Void)?) async {
+    static func run(job: Job, quality: Double, ac3Copies: Bool, remux: Bool = false, log: ((String) -> Void)?) async {
         let url = await job.url
-        log?("Converting \(url.lastPathComponent) to H.265 / MP4 (quality \(String(format: "%.2f", quality)))")
+        if remux {
+            log?("Remuxing \(url.lastPathComponent) to MP4 (video copied, no re-encode)")
+        } else {
+            log?("Converting \(url.lastPathComponent) to H.265 / MP4 (quality \(String(format: "%.2f", quality)))")
+        }
         let token = await job.cancelToken
         await MainActor.run {
             job.state = .encoding
             job.progress = 0
-            job.conversion = Job.ConversionStatus(fraction: 0, fps: 0, etaSeconds: nil)
+            job.conversion = Job.ConversionStatus(fraction: 0, fps: 0, etaSeconds: nil, remux: remux)
         }
 
         // Subtitles already extracted by this job (OCR'd SRTs) go into the MP4 as text tracks too.
@@ -29,8 +33,9 @@ enum VideoConversionStep {
             return names.filter { $0.hasPrefix(stem + ".") && $0.hasSuffix(".forced.sup") }.sorted()
                 .map { folder.appendingPathComponent($0) }
         }
-        var options = VideoConverter.Options(quality: quality, burnInSubtitles: true, ac3Copies: ac3Copies, extraSubtitleFiles: extractedSRTs)
+        var options = VideoConverter.Options(quality: quality, burnInSubtitles: !remux, ac3Copies: ac3Copies, extraSubtitleFiles: extractedSRTs)
         options.forcedSupFiles = forcedSups
+        options.remux = remux
         let outcome: Result<VideoConverter.Result, Error> = await Task.detached(priority: .userInitiated) {
             do {
                 let result = try VideoConverter.convert(source: url, options: options, cancel: token, log: { line in
@@ -38,7 +43,7 @@ enum VideoConversionStep {
                 }, progress: { p in
                     Task { @MainActor in
                         job.progress = p.fraction
-                        job.conversion = Job.ConversionStatus(fraction: p.fraction, fps: p.fps, etaSeconds: p.etaSeconds)
+                        job.conversion = Job.ConversionStatus(fraction: p.fraction, fps: p.fps, etaSeconds: p.etaSeconds, remux: remux)
                     }
                 })
                 return .success(result)
@@ -49,7 +54,7 @@ enum VideoConversionStep {
 
         switch outcome {
         case .success(let r):
-            var summary = String(format: "%@ · %.2f GB · video %.1f Mbit/s · %d audio track(s)",
+            var summary = String(format: remux ? "%@ · %.2f GB · video copied (%.1f Mbit/s) · %d audio track(s)" : "%@ · %.2f GB · video %.1f Mbit/s · %d audio track(s)",
                                  r.outputURL.lastPathComponent, Double(r.outputBytes) / 1e9, r.videoBitrate / 1e6, r.audioTracks)
             if r.ac3Copies > 0 { summary += " (incl. \(r.ac3Copies) AC-3 cop\(r.ac3Copies == 1 ? "y" : "ies"))" }
             if r.subtitleTracks > 0 { summary += " · \(r.subtitleTracks) subtitle track(s)" }
