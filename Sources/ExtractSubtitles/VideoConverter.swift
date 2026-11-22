@@ -509,7 +509,7 @@ final class VideoConverter {
         }
 
         // Chapters, title, container
-        a += ["-map_chapters", "0", "-map_metadata", "-1", "-metadata", "title=\(title)"]
+        a += ["-map_chapters", "0", "-map_metadata:g", "-1", "-metadata", "title=\(title)"]
         a += ["-strict", "experimental", "-max_muxing_queue_size", "4096", "-f", "mp4", output.path]
         return a
     }
