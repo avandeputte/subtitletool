@@ -262,6 +262,21 @@ struct SettingsView: View {
     @AppStorage(JobRunner.qualityKey) private var h265Quality = 0.85
     @AppStorage(JobRunner.ac3CopyKey) private var addAC3Copies = true
     @AppStorage(JobRunner.remuxKey) private var remuxVideo = false
+    @AppStorage(JobRunner.compareKey) private var compareWithOpenSubtitles = false
+    @State private var osAPIKey: String = ""
+    @State private var osUsername: String = ""
+    @State private var osPassword: String = ""
+
+    private func loadCredentials() {
+        let c = ReferenceSubtitles.Credentials.load()
+        osAPIKey = c.apiKey; osUsername = c.username; osPassword = c.password
+    }
+
+    private func saveCredentials() {
+        ReferenceSubtitles.Credentials(apiKey: osAPIKey.trimmingCharacters(in: .whitespacesAndNewlines),
+                                       username: osUsername.trimmingCharacters(in: .whitespacesAndNewlines),
+                                       password: osPassword).save()
+    }
 
     var body: some View {
         Form {
@@ -282,6 +297,18 @@ struct SettingsView: View {
                 }
                 .pickerStyle(.radioGroup)
                 Text("Everything runs on this Mac: ASS/SSA/WebVTT are converted directly, image subtitles (PGS) are rendered frame by frame and read with Apple Vision text recognition in the track's language.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section("Compare with OpenSubtitles") {
+                Toggle("After OCR, download the movie's subtitles from OpenSubtitles and repair OCR mistakes", isOn: $compareWithOpenSubtitles)
+                TextField("API key", text: $osAPIKey)
+                    .onChange(of: osAPIKey) { _ in saveCredentials() }
+                TextField("Username", text: $osUsername)
+                    .onChange(of: osUsername) { _ in saveCredentials() }
+                SecureField("Password", text: $osPassword)
+                    .onChange(of: osPassword) { _ in saveCredentials() }
+                Text("Needs a free opensubtitles.com account and its API key (profile › API consumers); they are kept in your Keychain. The OCR text stays the primary source: timings, cue count and line breaks are kept, and only differences that look like OCR confusions (I/l/1, apostrophes, ♪ residue, punctuation) are taken from the downloaded file. One file per movie and language is downloaded and cached; a free account allows about 20 downloads a day.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -310,6 +337,7 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 460)
         .padding(.bottom)
+        .onAppear(perform: loadCredentials)
     }
 }
 

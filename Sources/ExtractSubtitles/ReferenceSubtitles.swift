@@ -65,13 +65,33 @@ enum ReferenceSubtitles {
         }
     }
 
+    /// ~/Library/Caches/com.avandeputte.ExtractSubtitles/opensubtitles
+    static var cacheDirectory: URL {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return base.appendingPathComponent("com.avandeputte.ExtractSubtitles/opensubtitles", isDirectory: true)
+    }
+
+    /// CLI helper: repairs the SRT at `srtURL` in place, taking language and SDH flag from the
+    /// subtitle file name ("Movie (2020).en.sdh.srt").
+    static func improveFile(_ srtURL: URL, imdbID: String, log: ((String) -> Void)? = nil) async throws -> Report {
+        let stem: String = srtURL.deletingPathExtension().lastPathComponent
+        var movie = ""
+        if let r = stem.range(of: #"\(\d{4}\)"#, options: .regularExpression) { movie = String(stem[..<r.upperBound]) }
+        let d = TimedText.describe(fileName: srtURL.lastPathComponent, movie: movie)
+        let data = try Data(contentsOf: srtURL)
+        let r = try await improve(srt: data, imdbID: imdbID, language: d.tag, hearingImpaired: d.sdh,
+                                  credentials: Credentials.load(), cache: cacheDirectory, log: log)
+        if r.report.changedCues > 0 { try r.srt.write(to: srtURL, options: .atomic) }
+        return r.report
+    }
+
     // MARK: - High-level entry point
 
     /// Downloads the best reference for `imdbID`/`language` and repairs `srt`. `hearingImpaired`
     /// should mirror the OCR'd track (SDH tracks compare best against SDH references).
     /// Throws when the service cannot be used; a run with no usable alignment returns the
     /// input unchanged with a note in the report.
-    static func improve(srt: Data, imdbID: String, language: String, hearingImpaired: Bool,
+    static func improve(srt: Data, imdbID: String, language: String?, hearingImpaired: Bool,
                         credentials: Credentials, cache: URL? = nil,
                         log: ((String) -> Void)? = nil) async throws -> (srt: Data, report: Report) {
         guard credentials.isComplete else { throw Failure.notConfigured }
@@ -124,8 +144,8 @@ enum ReferenceSubtitles {
     }
 
     /// OpenSubtitles wants ISO 639-1 codes ("en", "fr", "pt-br"); accept whatever the track carries.
-    static func osLanguage(_ code: String) -> String {
-        let short = Naming.shortCode(code).lowercased()
+    static func osLanguage(_ code: String?) -> String {
+        let short = Naming.shortCode(code ?? "").lowercased()
         let parts = short.split(separator: "-").map(String.init)
         guard let base = parts.first, !base.isEmpty, base != "und" else { return "en" }
         if base == "pt", parts.count > 1, parts[1] == "br" { return "pt-br" }

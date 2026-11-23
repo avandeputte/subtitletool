@@ -128,7 +128,10 @@ final class JobRunner: ObservableObject {
     @AppStorage(JobRunner.ac3CopyKey) var addAC3Copies = true
     /// After extracting: copy the video into the MP4 instead of re-encoding it as H.265.
     @AppStorage(JobRunner.remuxKey) var remuxVideo = false
+    /// After OCR: download the movie's subtitles from OpenSubtitles and repair OCR confusions.
+    @AppStorage(JobRunner.compareKey) var compareWithOpenSubtitles = false
 
+    nonisolated static let compareKey = ReferenceSubtitles.enabledKey
     nonisolated static let renameKey = "renameFromIMDb"
     nonisolated static let convertKey = "convertToH265"
     nonisolated static let qualityKey = "h265Quality"
@@ -383,6 +386,29 @@ enum SubtitleExtractor {
                 log?("    conversion failed: \(error.localizedDescription)")
             }
             await MainActor.run { result.detailProgress = nil }
+
+            // Optional: repair OCR confusions from a downloaded OpenSubtitles file (OCR stays primary).
+            if produced, !track.kind.isTextBased, UserDefaults.standard.bool(forKey: JobRunner.compareKey),
+               let imdbID = await MainActor.run({ job.identity?.imdbID }), let ocrSRT = srtData[track.number] {
+                let sdh: Bool = Naming.isSDH(track) || (analyses[track.number]?.sdhRatio ?? 0) > 0.05
+                do {
+                    log?("    comparing with OpenSubtitles …")
+                    let r = try await ReferenceSubtitles.improve(srt: ocrSRT, imdbID: imdbID, language: track.language,
+                                                                 hearingImpaired: sdh,
+                                                                 credentials: ReferenceSubtitles.Credentials.load(),
+                                                                 cache: ReferenceSubtitles.cacheDirectory, log: log)
+                    srtData[track.number] = r.srt
+                    analyses[track.number]?.text = String(data: r.srt, encoding: .utf8)
+                    if r.report.changedCues > 0 {
+                        notes.append("\(r.report.changedCues) cue(s) repaired from OpenSubtitles")
+                    } else if let n = r.report.notes.first {
+                        notes.append("OpenSubtitles: \(n)")
+                    }
+                } catch {
+                    notes.append("OpenSubtitles comparison: \(error.localizedDescription)")
+                    log?("    OpenSubtitles comparison failed: \(error.localizedDescription)")
+                }
+            }
 
             let finalNotes = notes, finalProduced = produced
             await MainActor.run {

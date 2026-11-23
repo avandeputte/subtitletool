@@ -136,12 +136,18 @@ enum CommandLineMode {
         // "--quality 0.9" takes a value; everything else that does not start with "--" is a file.
         var files: [URL] = []
         var quality = UserDefaults.standard.object(forKey: JobRunner.qualityKey) as? Double ?? 0.85
+        var compareIMDbID: String? = nil
         let list = Array(args)
         var skipNext = false
         for (i, a) in list.enumerated() {
             if skipNext { skipNext = false; continue }
             if a == "--quality" {
                 if i + 1 < list.count, let q = Double(list[i + 1]) { quality = max(0.1, min(1.0, q)) }
+                skipNext = true
+                continue
+            }
+            if a == "--compare" {
+                if i + 1 < list.count { compareIMDbID = list[i + 1] }
                 skipNext = true
                 continue
             }
@@ -208,12 +214,13 @@ enum CommandLineMode {
             exit(failures == 0 ? 0 : 1)
         }
         guard !files.isEmpty else {
-            FileHandle.standardError.write(Data("usage: ExtractSubtitles --cli [--list] [--no-convert|--local] [--no-rename|--rename] [--h265|--remux] [--quality 0.9] [--no-ac3] file.mkv …\n       ExtractSubtitles --cli --ocr [--force] file.sup …\n".utf8))
+            FileHandle.standardError.write(Data("usage: ExtractSubtitles --cli [--list] [--no-convert|--local] [--no-rename|--rename] [--h265|--remux] [--quality 0.9] [--no-ac3] file.mkv …\n       ExtractSubtitles --cli --ocr [--force] [--compare tt1234567] file.sup …\n".utf8))
             exit(2)
         }
         if args.contains("--ocr") {
             // Redo the OCR of extracted .sup files; the MKV is not needed.
             let force = args.contains("--force")
+            let compareID: String? = compareIMDbID
             Task.detached {
                 var failures = 0
                 for url in files {
@@ -221,6 +228,11 @@ enum CommandLineMode {
                     do {
                         let out = try await LocalConverter.ocrSUPFile(url, force: force)
                         print("  wrote \(out.lastPathComponent)")
+                        if let imdbID = compareID {
+                            let report = try await ReferenceSubtitles.improveFile(out, imdbID: imdbID) { line in print(line) }
+                            print("  OpenSubtitles: \(report.alignedCues) cues aligned, \(report.changedCues) cues / \(report.changedWords) words repaired")
+                            for sample in report.samples { print("    \(sample)") }
+                        }
                     } catch {
                         print("  error: \(error.localizedDescription)"); failures += 1
                     }
