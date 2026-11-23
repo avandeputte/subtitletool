@@ -610,6 +610,8 @@ enum ReferenceSubtitles {
                 core = coreRef.prefix(1).lowercased() + String(coreRef.dropFirst())
             }
         }
+        // A leading apostrophe misread as a double quote: "bout -> 'bout, not "'bout.
+        if lead.hasSuffix("\""), core.hasPrefix("'") { return String(lead.dropLast()) + core + trail }
         return lead + core + trail
     }
 
