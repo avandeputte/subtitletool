@@ -79,6 +79,8 @@ final class Job: ObservableObject, Identifiable {
     @Published var conversionOutput: URL?
     @Published var conversionSummary: String = ""
     @Published var cancelRequested = false
+    /// IMDb id once the movie is identified (used to find a reference subtitle).
+    var imdbID: String?
 
     enum State: Equatable { case queued, identifying, scanning, extracting, converting, encoding, done, failed(String) }
 
@@ -378,6 +380,31 @@ enum SubtitleExtractor {
                 srtData[track.number] = srt
                 analyses[track.number]?.text = String(data: srt, encoding: .utf8)
                 produced = true
+
+                // Optional: repair likely OCR misreads from an online subtitle. Any failure keeps
+                // the OCR result as it is. Forced and commentary tracks have no comparable file.
+                if track.kind == .pgs, ReferenceSubtitles.isEnabled, !track.isForced, !track.isCommentary,
+                   analyses[track.number]?.allCuesForced != true {
+                    if let imdbID = await MainActor.run(body: { job.imdbID }) {
+                        let sdh: Bool = Naming.isSDH(track) || (analyses[track.number]?.sdhRatio ?? 0) > 0.05
+                        do {
+                            let compared = try await ReferenceSubtitles.improve(
+                                srt: srt, imdbID: imdbID, language: track.language, hearingImpaired: sdh,
+                                credentials: .load(), cache: ReferenceSubtitles.cacheFolder,
+                                log: { line in log?("  " + line) })
+                            srtData[track.number] = compared.srt
+                            analyses[track.number]?.text = String(data: compared.srt, encoding: .utf8)
+                            let cueCount = ReferenceSubtitles.parseSRT(srt).count
+                            log?("    " + ReferenceSubtitles.summary(compared.report, cueCount: cueCount))
+                        } catch {
+                            notes.append("OpenSubtitles comparison skipped: \(error.localizedDescription)")
+                            log?("    OpenSubtitles comparison skipped: \(error.localizedDescription)")
+                        }
+                    } else {
+                        notes.append("OpenSubtitles comparison skipped: the movie has no IMDb match")
+                        log?("    OpenSubtitles comparison skipped: the movie has no IMDb match")
+                    }
+                }
             } catch {
                 notes.append(error.localizedDescription)
                 log?("    conversion failed: \(error.localizedDescription)")

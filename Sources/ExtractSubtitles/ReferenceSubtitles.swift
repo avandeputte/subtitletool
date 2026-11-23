@@ -37,6 +37,22 @@ enum ReferenceSubtitles {
         }
     }
 
+    static var isEnabled: Bool { UserDefaults.standard.bool(forKey: enabledKey) }
+
+    static var cacheFolder: URL {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("com.avandeputte.ExtractSubtitles/opensubtitles", isDirectory: true)
+    }
+
+    /// One line for the log: which file was used and what it changed.
+    static func summary(_ r: Report, cueCount: Int) -> String {
+        var line = "compared with " + (r.candidate.map { "\"\($0.release)\"" } ?? "the cached OpenSubtitles file")
+        line += ": \(r.alignedCues)/\(cueCount) cues aligned, \(r.changedCues) cues / \(r.changedWords) words repaired"
+        if !r.notes.isEmpty { line += " (" + r.notes.joined(separator: "; ") + ")" }
+        return line
+    }
+
     // MARK: - Report
 
     struct Report {
@@ -564,35 +580,36 @@ enum ReferenceSubtitles {
             y = y.replacingOccurrences(of: from, with: to)
         }
         if x == y { return true }
-        guard b.count >= 4 else { return false }
-        // One-character difference at the same length, in a word otherwise identical.
-        if a.count == b.count {
-            let diffs: Int = zip(a, b).filter { $0.0 != $0.1 }.count
-            return diffs == 1 && b.count >= 6
-        }
-        return false
+        // One letter swapped for a look-alike, in a longer word ("tellas" / "fellas"). Other
+        // one-letter differences can be real words ("mother" / "bother") and stay as read.
+        guard b.count >= 5, a.count == b.count else { return false }
+        let different = zip(a, b).filter { $0.0 != $0.1 }
+        guard different.count == 1, let d = different.first else { return false }
+        return lookAlikes.contains { $0.contains(d.0) && $0.contains(d.1) }
     }
 
-    /// Spelling from the reference, case and surrounding punctuation style from the OCR where
-    /// the keys agree; otherwise the reference word with the OCR's leading/trailing punctuation.
+    private static let lookAlikes: [Set<Character>] = [["t", "f"], ["c", "e"], ["h", "b"], ["n", "u"], ["e", "o"], ["a", "o"], ["g", "q"]]
+
+    /// The reference spelling of a confusable word, with the OCR's capitalisation and punctuation.
+    /// A difference that is only case, or a reference that lacks the OCR's apostrophe, keeps the OCR.
     static func mergeConfusable(ocr: String, ref: String) -> String {
         let (lead, coreOCR, trail) = splitPunctuation(ocr)
-        let (_, coreRef, trailRef) = splitPunctuation(ref)
-        guard !coreRef.isEmpty else { return ocr }
+        let coreRef: String = splitPunctuation(ref).1.replacingOccurrences(of: "\u{2019}", with: "'")
+        guard !coreRef.isEmpty, !coreOCR.isEmpty else { return ocr }
+        if coreOCR.lowercased() == coreRef.lowercased() { return ocr }
+        if coreOCR.contains("'") && !coreRef.contains("'") { return ocr }
+        if coreOCR.count > 1 && coreOCR.allSatisfy({ $0.isNumber }) { return ocr }   // a real number
         var core: String = coreRef
-        // Keep the OCR's capitalisation pattern when it is all-caps or capitalised and the
-        // reference is lower-case (speaker labels, shouting).
         if coreOCR == coreOCR.uppercased(), coreOCR != coreOCR.lowercased(), coreOCR.count > 1 {
             core = coreRef.uppercased()
-        } else if let f = coreOCR.first, f.isUppercase, coreRef.first?.isLowercase == true {
-            core = coreRef.prefix(1).uppercased() + String(coreRef.dropFirst())
+        } else if let f = coreOCR.first, let r = coreRef.first {
+            if f.isUppercase, r.isLowercase {
+                core = coreRef.prefix(1).uppercased() + String(coreRef.dropFirst())
+            } else if f.isLowercase, r.isUppercase, !(f == "l" && r == "I") {
+                core = coreRef.prefix(1).lowercased() + String(coreRef.dropFirst())
+            }
         }
-        // Punctuation: trust the reference for apostrophes inside the word (handled by core),
-        // keep the OCR's trailing punctuation unless the OCR has none and the reference has a
-        // plain comma/period/question/exclamation mark.
-        var t: String = trail
-        if t.isEmpty, let last = trailRef.last, ",.?!".contains(last), trailRef.count == 1 { t = trailRef }
-        return lead + core + t
+        return lead + core + trail
     }
 
     static func splitPunctuation(_ w: String) -> (String, String, String) {
@@ -623,14 +640,22 @@ enum ReferenceSubtitles {
                 if let w0 = words.first, refStarts, lineStart == 0 {
                     let t: String = tokens[w0].text
                     let note: String = rf.allSatisfy { $0 == "♪" } ? rf : "♪"
-                    if residue.contains(t) { tokens[w0].text = note; changed += 1 }
-                    else if t == "-" || t == "–", words.count > 1, residue.contains(tokens[words[1]].text) { tokens[words[1]].text = note; changed += 1 }
+                    // The next word must agree with the reference, so a real first word stays.
+                    func follows(_ k: Int) -> Bool {
+                        k < words.count && reference.count > 1 && wordKey(tokens[words[k]].text) == wordKey(reference[1])
+                    }
+                    if residue.contains(t), follows(1) { tokens[w0].text = note; changed += 1 }
+                    else if t == "-" || t == "–", words.count > 2, residue.contains(tokens[words[1]].text), follows(2) {
+                        tokens[words[1]].text = note; changed += 1
+                    }
                 }
                 if let wN = words.last, refEnds, idx == tokens.count {
                     let t: String = tokens[wN].text
                     let bare: String = (t.hasSuffix(".") || t.hasSuffix(",")) ? String(t.dropLast()) : t
                     let note: String = rl.allSatisfy { $0 == "♪" } ? rl : "♪"
-                    if residue.contains(bare) { tokens[wN].text = note; changed += 1 }
+                    let before: String? = words.count > 1 ? tokens[words[words.count - 2]].text : nil
+                    let agrees: Bool = reference.count > 1 && before.map { wordKey($0) == wordKey(reference[reference.count - 2]) } == true
+                    if residue.contains(bare), agrees { tokens[wN].text = note; changed += 1 }
                 }
                 lineStart = idx + 1
             }

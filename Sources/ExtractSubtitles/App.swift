@@ -138,10 +138,16 @@ enum CommandLineMode {
         var quality = UserDefaults.standard.object(forKey: JobRunner.qualityKey) as? Double ?? 0.85
         let list = Array(args)
         var skipNext = false
+        var compareIMDb: String?
         for (i, a) in list.enumerated() {
             if skipNext { skipNext = false; continue }
             if a == "--quality" {
                 if i + 1 < list.count, let q = Double(list[i + 1]) { quality = max(0.1, min(1.0, q)) }
+                skipNext = true
+                continue
+            }
+            if a == "--compare" {
+                if i + 1 < list.count { compareIMDb = list[i + 1] }
                 skipNext = true
                 continue
             }
@@ -208,18 +214,23 @@ enum CommandLineMode {
             exit(failures == 0 ? 0 : 1)
         }
         guard !files.isEmpty else {
-            FileHandle.standardError.write(Data("usage: ExtractSubtitles --cli [--list] [--no-convert|--local] [--no-rename|--rename] [--h265|--remux] [--quality 0.9] [--no-ac3] file.mkv …\n       ExtractSubtitles --cli --ocr [--force] file.sup …\n".utf8))
+            FileHandle.standardError.write(Data("usage: ExtractSubtitles --cli [--list] [--no-convert|--local] [--no-rename|--rename] [--h265|--remux] [--quality 0.9] [--no-ac3] file.mkv …\n       ExtractSubtitles --cli --ocr [--force] [--compare tt1234567] file.sup …\n".utf8))
             exit(2)
         }
         if args.contains("--ocr") {
             // Redo the OCR of extracted .sup files; the MKV is not needed.
             let force = args.contains("--force")
+            if let id = compareIMDb, id.range(of: #"^tt\d+$"#, options: .regularExpression) == nil {
+                FileHandle.standardError.write(Data("--compare needs an IMDb id such as tt1234567\n".utf8))
+                exit(2)
+            }
+            let compareID = compareIMDb
             Task.detached {
                 var failures = 0
                 for url in files {
                     print("OCR \(url.lastPathComponent)")
                     do {
-                        let out = try await LocalConverter.ocrSUPFile(url, force: force)
+                        let out = try await LocalConverter.ocrSUPFile(url, force: force, compareIMDb: compareID) { line in print(line) }
                         print("  wrote \(out.lastPathComponent)")
                     } catch {
                         print("  error: \(error.localizedDescription)"); failures += 1

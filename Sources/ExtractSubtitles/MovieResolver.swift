@@ -184,6 +184,7 @@ final class MovieResolver: ObservableObject {
     /// Renames the job's file to "Movie Name (yyyy).<ext>" next to itself. Keeps the name (with a
     /// note) when IMDb has no year, the target exists, or the move fails.
     func rename(job: Job, to found: MovieIdentity, log: ((String) -> Void)?) {
+        job.imdbID = found.imdbID
         job.identity = found
         let url = job.url
         guard let base = found.baseName else {

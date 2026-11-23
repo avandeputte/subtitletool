@@ -318,11 +318,13 @@ enum LocalConverter {
 
     /// OCRs `<name>.sup` to `<name>.srt` next to it. An existing SRT is only replaced with `force`;
     /// otherwise the result goes to `<name> 2.srt` (or the next free number).
-    static func ocrSUPFile(_ url: URL, force: Bool, progress: ((Double) -> Void)? = nil) async throws -> URL {
+    static func ocrSUPFile(_ url: URL, force: Bool, compareIMDb: String? = nil, log: ((String) -> Void)? = nil,
+                           progress: ((Double) -> Void)? = nil) async throws -> URL {
         let stem: String = url.deletingPathExtension().lastPathComponent
         var movie = ""
         if let r = stem.range(of: #"\(\d{4}\)"#, options: .regularExpression) { movie = String(stem[..<r.upperBound]) }
-        let tag: String = TimedText.describe(fileName: url.lastPathComponent, movie: movie).tag
+        let info = TimedText.describe(fileName: url.lastPathComponent, movie: movie)
+        let tag: String = info.tag
         let cues = try await ocrPGS(frames: try readSUP(url), language: tag, progress: progress)
 
         let folder = url.deletingLastPathComponent()
@@ -334,7 +336,23 @@ enum LocalConverter {
                 n += 1
             }
         }
-        try encodeSRT(cues).write(to: out, options: .atomic)
+        var srt: Data = encodeSRT(cues)
+        if let imdbID = compareIMDb {
+            if info.forced || info.commentary {
+                log?("  comparison skipped: forced and commentary tracks have no comparable file")
+            } else {
+                do {
+                    let compared = try await ReferenceSubtitles.improve(
+                        srt: srt, imdbID: imdbID, language: tag, hearingImpaired: info.sdh,
+                        credentials: .load(), cache: ReferenceSubtitles.cacheFolder, log: log)
+                    srt = compared.srt
+                    log?("  " + ReferenceSubtitles.summary(compared.report, cueCount: cues.count))
+                } catch {
+                    log?("  comparison skipped, OCR result kept: \(error.localizedDescription)")
+                }
+            }
+        }
+        try srt.write(to: out, options: .atomic)
         return out
     }
 

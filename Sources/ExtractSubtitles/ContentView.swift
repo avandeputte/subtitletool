@@ -262,6 +262,21 @@ struct SettingsView: View {
     @AppStorage(JobRunner.qualityKey) private var h265Quality = 0.85
     @AppStorage(JobRunner.ac3CopyKey) private var addAC3Copies = true
     @AppStorage(JobRunner.remuxKey) private var remuxVideo = false
+    @AppStorage(ReferenceSubtitles.enabledKey) private var compareOnline = false
+    @State private var osAPIKey = ""
+    @State private var osUsername = ""
+    @State private var osPassword = ""
+    @State private var osLoaded = false
+    @State private var osSaved = false
+
+    private func loadOpenSubtitles() {
+        guard compareOnline, !osLoaded else { return }
+        let c = ReferenceSubtitles.Credentials.load()
+        osAPIKey = c.apiKey
+        osUsername = c.username
+        osPassword = c.password
+        osLoaded = true
+    }
 
     var body: some View {
         Form {
@@ -285,6 +300,26 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Section("Compare with OpenSubtitles") {
+                Toggle("Compare with OpenSubtitles after OCR", isOn: $compareOnline)
+                if compareOnline {
+                    SecureField("API key", text: $osAPIKey)
+                    TextField("Username", text: $osUsername)
+                    SecureField("Password", text: $osPassword)
+                    HStack {
+                        Button("Save to Keychain") {
+                            ReferenceSubtitles.Credentials(apiKey: osAPIKey, username: osUsername, password: osPassword).save()
+                            osSaved = true
+                        }
+                        if osSaved { Text("Saved").font(.caption).foregroundStyle(.secondary) }
+                    }
+                }
+                Text("Your extracted subtitles stay the primary source. A subtitle for the same movie and language is downloaded and used only to repair likely OCR misreads (I/l/1, apostrophes, look-alike letters, music notes); timing, line breaks and wording are kept. It needs the movie's IMDb match and a free opensubtitles.com account with an API key. The key and login are stored only in your Keychain.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .onAppear { loadOpenSubtitles() }
+            .onChange(of: compareOnline) { _ in loadOpenSubtitles() }
             Section("Video conversion") {
                 Toggle("Convert to MP4 after extracting", isOn: $convertToH265)
                 Picker("Video", selection: $remuxVideo) {
