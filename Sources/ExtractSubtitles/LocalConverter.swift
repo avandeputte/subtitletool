@@ -645,8 +645,8 @@ enum OCRCleanup {
         Fix(regex: rx("\\blf\\b"), template: "If"),
         Fix(regex: rx("\\bWeill\\b"), template: "We'll"),
         Fix(regex: rx("\\bMil\\b"), template: "I'll"),
-        // "1" before a common verb (not "1 mile", "$1 bill", "2.1 million")
-        Fix(regex: rx("(?<![\\d$.,:])(?<!at )\\b1 (?=(?:am|may|wanna|gotta|gonna|guess|thought|told|believe|remember|hope|feel|should|might|must|know|think|was|have|had|want|love|can|will|would|could|did|do|need|got|see|said|mean|just|never)\\b)"), template: "I "),
+        // "1" before a lowercase word is the pronoun, unless it counts something ("1 mile", "$1 bill")
+        Fix(regex: rx("(?<![\\d$.,:])(?<!at )\\b1 (?=[a-z])(?!(?:pm|st|nd|rd|th|of|in|out|or|and|to|more|mile|miles|day|week|month|year|hour|minute|second|inch|foot|yard|acre|percent|dollar|cent|buck|million|billion|thousand|hundred)\\b)"), template: "I "),
         Fix(regex: rx("\"(?=cause\\b)"), template: "'"),
         // Contractions that lost the apostrophe ("lets" is a real word and stays)
         Fix(regex: rx("\\b([Cc])ant\\b"), template: "$1an't"),
