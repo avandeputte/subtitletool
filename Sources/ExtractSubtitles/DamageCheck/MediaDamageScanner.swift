@@ -26,6 +26,7 @@ struct DamageReport: Sendable {
     var lastFrame: Double?
     var findings: [DamageFinding]
     var readEveryByte: Bool
+    var sampled = false
     var elapsed: Double
 
     var severity: DamageSeverity { findings.map(\.severity).max() ?? .ok }
@@ -33,7 +34,7 @@ struct DamageReport: Sendable {
         if let worst = findings.max(by: { $0.severity < $1.severity }) { return worst.text }
         var parts = [format]
         if let duration { parts.append(DamageFormat.time(duration)) }
-        parts.append(readEveryByte ? "every byte read" : "structure checked")
+        parts.append(readEveryByte ? "every byte read" : (sampled ? "sampled from its index" : "structure checked"))
         return parts.joined(separator: " · ")
     }
 }
@@ -51,8 +52,10 @@ enum DamageFormat {
 /// Read-only checker for MKV and MP4 files. Files are opened O_RDONLY and nothing is ever written.
 ///
 /// The quick check follows the container structure, so it jumps from cluster to cluster (or chunk
-/// to chunk) and reads a few MB of a 70 GB file. The full check also reads every byte to find
-/// read errors and zero-filled runs that sit entirely inside a cluster.
+/// to chunk). On a NAS or spinning disk, where every jump costs a seek, it visits a few hundred
+/// places chosen from the file's own index plus the whole tail, and falls back to the exact walk
+/// as soon as one of them looks wrong. The full check also reads every byte to find read errors
+/// and zero-filled runs that sit entirely inside a cluster.
 enum MediaDamageScanner {
     static let videoExtensions: Set<String> = ["mkv", "mp4", "m4v"]
     /// A run of zeros this long cannot occur in compressed audio/video that is interleaved.
@@ -60,6 +63,8 @@ enum MediaDamageScanner {
     /// Missing playback time that is reported as damage, and as worth a look.
     static let damagedShortfall = 30.0
     static let warningShortfall = 5.0
+    /// Places visited per file when seeks are expensive.
+    static let sampleCount = 300
 
     struct Cancelled: Error {}
 
@@ -67,6 +72,8 @@ enum MediaDamageScanner {
         let file: MKVFile
         let isCancelled: () -> Bool
         let progress: (Double) -> Void
+        /// True when jumps are expensive: visit a sample of the file instead of every cluster.
+        var sampled = false
         private let buffer = UnsafeMutableRawPointer.allocate(byteCount: 1 << 20, alignment: 4096)
         private var lastProgress = -1.0
 
@@ -152,7 +159,14 @@ enum MediaDamageScanner {
         videoExtensions.contains(url.pathExtension.lowercased()) && !url.lastPathComponent.hasPrefix("._")
     }
 
-    static func scan(url: URL, readEveryByte: Bool,
+    /// Network volumes and spinning disks pay for each jump with a seek.
+    static func seeksAreExpensive(_ file: MKVFile) -> Bool {
+        var fs = statfs()
+        guard fstatfs(file.fd, &fs) == 0 else { return true }
+        return fs.f_flags & UInt32(MNT_LOCAL) == 0 || file.isRotational
+    }
+
+    static func scan(url: URL, readEveryByte: Bool, forceSampling: Bool = false,
                      isCancelled: @escaping () -> Bool = { false },
                      progress: @escaping (Double) -> Void = { _ in }) throws -> DamageReport {
         let started = Date()
@@ -161,6 +175,7 @@ enum MediaDamageScanner {
         // With a full read the structure pass is a small part of the work.
         let structureShare = readEveryByte ? 0.03 : 1.0
         let structural = Context(file: file, isCancelled: isCancelled) { progress($0 * structureShare) }
+        structural.sampled = forceSampling || seeksAreExpensive(file)
 
         var result: ContainerResult
         if url.pathExtension.lowercased() == "mkv" {
@@ -183,7 +198,7 @@ enum MediaDamageScanner {
         let ordered = result.findings.sorted { $0.severity > $1.severity }
         return DamageReport(url: url, size: file.size, format: result.format, duration: result.duration,
                             lastFrame: result.lastFrame, findings: ordered, readEveryByte: readEveryByte,
-                            elapsed: Date().timeIntervalSince(started))
+                            sampled: result.sampled, elapsed: Date().timeIntervalSince(started))
     }
 
     /// Reads the whole file in order, reporting read errors and zero runs not already reported.
@@ -242,6 +257,7 @@ struct ContainerResult {
     var format: String
     var duration: Double?
     var lastFrame: Double?
+    var sampled = false
     var findings: [DamageFinding] = []
     /// Byte ranges already explained (reported damage, or padding such as Void and free boxes).
     var knownRanges: [Range<Int>] = []
@@ -299,7 +315,19 @@ private final class MKVDamageCheck {
             add(.damaged, "Truncated: the file is \(DamageFormat.bytes(declaredEnd - size)) shorter than its header says.")
         }
 
-        try walkSegment()
+        let findingsBefore = result.findings.count
+        if try !(context.sampled && sampledWalk()) {
+            // Exact walk: the only pass on fast disks, and the way to pin down damage a sample found.
+            result.sampled = false
+            result.findings.removeLast(result.findings.count - findingsBefore)
+            result.knownRanges = []
+            clusterOffsets = []
+            clusterTimes = []
+            damage = []
+            damageEntries = []
+            firstBreakTime = nil
+            try walkSegment(from: segmentStart)
+        }
         finish(declaredEnd: declaredEnd)
         let offsets = clusterOffsets, times = clusterTimes
         result.timeAt = { offset in
@@ -314,8 +342,49 @@ private final class MKVDamageCheck {
         return result
     }
 
-    private func walkSegment() throws {
+    /// Checks evenly spaced clusters from the Cues, then walks everything after the last one.
+    /// Returns false when there is no usable index or anything looks wrong.
+    private func sampledWalk() throws -> Bool {
         var pos = segmentStart
+        while pos < limit {
+            r.pos = pos
+            guard let e = try? r.readElementHeader(), isTopLevel(e.id) else { return false }
+            if e.id == MKV.cluster { break }
+            guard let end = e.dataEnd, end <= size else { return false }
+            switch e.id {
+            case MKV.info: parseInfo(e)
+            case MKV.tracks: parseTracks(e)
+            case MKV.seekHead: parseSeekHead(e)
+            case MKV.cues:
+                cuesOffset = e.headerStart
+                if cuePositions.isEmpty { parseCues(e) }
+            default: break
+            }
+            pos = end
+        }
+        guard cuePositions.count >= 2, let last = cuePositions.last, last < limit else { return false }
+
+        let count = min(MediaDamageScanner.sampleCount, cuePositions.count - 1)
+        var previousTime = 0.0
+        for i in 0 ..< count {
+            let offset = cuePositions[i * (cuePositions.count - 1) / count]
+            try context.tick(0.9 * Double(i) / Double(count))
+            guard isPlausibleCluster(at: offset, minimumTime: previousTime) else { return false }
+            r.pos = offset
+            guard let e = try? r.readElementHeader(), let ts = clusterTimestamp(e) else { return false }
+            previousTime = Double(ts) * scale / 1e9
+            clusterOffsets.append(offset)
+            clusterTimes.append(previousTime)
+        }
+        guard isPlausibleCluster(at: last, minimumTime: previousTime) else { return false }
+        try walkSegment(from: last)
+        guard damageEntries.isEmpty, !result.findings.contains(where: { $0.severity == .damaged }) || limit < size else { return false }
+        result.sampled = true
+        return true
+    }
+
+    private func walkSegment(from start: Int) throws {
+        var pos = start
         var previous: (offset: Int, end: Int, time: Double)?
         while pos < limit {
             try context.tick(Double(pos) / Double(max(1, size)))
@@ -514,7 +583,7 @@ private final class MKVDamageCheck {
            !result.findings.contains(where: { $0.text.hasPrefix("Playback stops") }), duration - first >= MediaDamageScanner.damagedShortfall {
             add(.damaged, "Playback is interrupted at \(DamageFormat.time(first)) of \(DamageFormat.time(duration)).")
         }
-        if !cuePositions.isEmpty {
+        if !cuePositions.isEmpty, !result.sampled {
             let known = Set(clusterOffsets)
             let dangling = cuePositions.filter { p in !known.contains(p) && !damage.contains { $0.contains(p) } }
             if !dangling.isEmpty {
@@ -556,7 +625,8 @@ private final class MKVDamageCheck {
 
     /// Follows the blocks of one cluster. `badOffset` is where they stop being valid.
     private func walkBlocks(_ e: EBMLReader.Element, clusterTime: UInt64) -> (end: Int, badOffset: Int?, lastEnd: Double?) {
-        var probe = r
+        // Blocks are close together: one large read replaces hundreds of small ones.
+        var probe = EBMLReader(file: context.file, windowSize: 1 << 20)
         var p = e.dataOffset
         let end = min(e.dataEnd ?? size, size)
         var lastEnd: Double?
@@ -664,6 +734,9 @@ private final class MKVDamageCheck {
     }
 
     private func parseCues(_ e: EBMLReader.Element) {
+        let smallWindow = r
+        r = EBMLReader(file: context.file, windowSize: 1 << 20)
+        defer { r = smallWindow }
         var positions = Set<Int>()
         children(e) { point in
             guard point.id == MKV.cuePoint else { return }
@@ -892,10 +965,12 @@ private final class MP4DamageCheck {
     private func probe(_ track: Track) throws {
         let chunks = track.chunks.filter { $0.offset + $0.length <= size }
         guard !chunks.isEmpty else { return }
-        let budget = context.file.isRotational ? 1500 : 20000
+        let budget = context.sampled ? MediaDamageScanner.sampleCount : 20000
+        result.sampled = context.sampled && chunks.count > budget
         let step = max(1, chunks.count / budget)
-        var i = 0
-        while i < chunks.count {
+        var indices = Array(stride(from: 0, to: chunks.count, by: step))
+        if indices.last != chunks.count - 1 { indices.append(chunks.count - 1) }
+        for i in indices {
             try context.tick(0.5 + 0.5 * Double(i) / Double(chunks.count))
             let chunk = chunks[i]
             if !result.knownRanges.contains(where: { $0.contains(chunk.offset) }),
@@ -903,7 +978,6 @@ private final class MP4DamageCheck {
                 result.knownRanges.append(run)
                 add(.damaged, "\(DamageFormat.bytes(run.count)) of zeros at byte \(run.lowerBound), around \(DamageFormat.time(chunk.time)).")
             }
-            i += step
         }
     }
 

@@ -323,13 +323,13 @@ final class DamageCheckWindow {
 
 /// `--cli --check [--deep] folder-or-file …` prints one result per file. Exit status 1 if any is damaged.
 enum DamageCheckCLI {
-    static func run(paths: [URL], readEveryByte: Bool) -> Never {
+    static func run(paths: [URL], readEveryByte: Bool, forceSampling: Bool = false) -> Never {
         let files = MediaDamageScanner.collectFiles(paths)
         var damaged = 0
         for url in files {
             do {
-                let report = try MediaDamageScanner.scan(url: url, readEveryByte: readEveryByte)
-                print("[\(report.severity.label)] \(url.path) (\(String(format: "%.1f", report.elapsed))s)")
+                let report = try MediaDamageScanner.scan(url: url, readEveryByte: readEveryByte, forceSampling: forceSampling)
+                print("[\(report.severity.label)] \(url.path) (\(String(format: "%.1f", report.elapsed))s\(report.sampled ? ", sampled" : ""))")
                 for finding in report.findings { print("    \(finding.text)") }
                 if report.severity == .damaged { damaged += 1 }
             } catch {
