@@ -230,7 +230,7 @@ enum CommandLineMode {
                 for url in files {
                     print("OCR \(url.lastPathComponent)")
                     do {
-                        let out = try await LocalConverter.ocrSUPFile(url, force: force, compareIMDb: compareID) { line in print(line) }
+                        let out = try await LocalConverter.ocrSUPFile(url, force: force, compareIMDb: compareID, log: { line in print(line) })
                         print("  wrote \(out.lastPathComponent)")
                     } catch {
                         print("  error: \(error.localizedDescription)"); failures += 1
