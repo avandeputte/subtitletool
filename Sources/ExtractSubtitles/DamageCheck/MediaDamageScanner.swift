@@ -12,6 +12,32 @@ enum DamageSeverity: Int, Comparable, Sendable {
     }
 }
 
+/// How much of each file the check visits. The last `tailBytes` are always read in full.
+enum DamageCheckLevel: Int, CaseIterable, Sendable {
+    case places300, places1000, places3000, places10000, everyPlace, everyByte
+    static let storageKey = "damageCheckLevel"
+    static let standard = DamageCheckLevel.places1000
+
+    /// Places sampled per file on a NAS or spinning disk; nil means no sampling.
+    var places: Int? {
+        switch self {
+        case .places300: return 300
+        case .places1000: return 1000
+        case .places3000: return 3000
+        case .places10000: return 10000
+        case .everyPlace, .everyByte: return nil
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .everyPlace: return "Every indexed location"
+        case .everyByte: return "Every byte"
+        default: return "\(places!.formatted()) places per file"
+        }
+    }
+}
+
 struct DamageFinding: Identifiable, Sendable {
     let id = UUID()
     let severity: DamageSeverity
@@ -63,8 +89,8 @@ enum MediaDamageScanner {
     /// Missing playback time that is reported as damage, and as worth a look.
     static let damagedShortfall = 30.0
     static let warningShortfall = 5.0
-    /// Places visited per file when seeks are expensive.
-    static let sampleCount = 300
+    /// The end of a file is where interrupted copies fail, so it is always read in full.
+    static let tailBytes = 1 << 30
 
     struct Cancelled: Error {}
 
@@ -74,6 +100,9 @@ enum MediaDamageScanner {
         let progress: (Double) -> Void
         /// True when jumps are expensive: visit a sample of the file instead of every cluster.
         var sampled = false
+        /// Clusters or chunks to visit when sampling, and video chunks to probe in any mode.
+        var sampleCount = Int.max
+        var chunkBudget = 20000
         private let buffer = UnsafeMutableRawPointer.allocate(byteCount: 1 << 20, alignment: 4096)
         private var lastProgress = -1.0
 
@@ -126,6 +155,25 @@ enum MediaDamageScanner {
             }
             return hi - lo >= mib ? lo ..< hi : nil
         }
+
+        /// Evenly spaced 4 KB probes across `range`: any zero-filled run longer than the spacing is hit.
+        func sampleZeroRuns(_ range: Range<Int>, count: Int) throws -> [Range<Int>] {
+            guard count > 0, range.count >= 4096 else { return [] }
+            let step = max(4096, range.count / count)
+            var runs: [Range<Int>] = []
+            var offset = range.lowerBound
+            while offset + 4096 <= range.upperBound {
+                try tick(0.6 * Double(offset) / Double(max(1, file.size)))
+                let aligned = max(range.lowerBound, offset & ~4095)
+                if let run = zeroRun(around: aligned, within: range) {
+                    runs.append(run)
+                    offset = max(offset + step, run.upperBound)
+                } else {
+                    offset += step
+                }
+            }
+            return runs
+        }
     }
 
     static func allZero(_ p: UnsafeRawPointer, _ n: Int) -> Bool {
@@ -166,16 +214,23 @@ enum MediaDamageScanner {
         return fs.f_flags & UInt32(MNT_LOCAL) == 0 || file.isRotational
     }
 
-    static func scan(url: URL, readEveryByte: Bool, forceSampling: Bool = false,
+    static func scan(url: URL, level: DamageCheckLevel = .standard, forceSampling: Bool = false,
                      isCancelled: @escaping () -> Bool = { false },
                      progress: @escaping (Double) -> Void = { _ in }) throws -> DamageReport {
         let started = Date()
         let file = try MKVFile(url: url)
         let context = Context(file: file, isCancelled: isCancelled, progress: progress)
-        // With a full read the structure pass is a small part of the work.
-        let structureShare = readEveryByte ? 0.03 : 1.0
+        let readEveryByte = level == .everyByte
+        // The structure pass is a small part of a full read.
+        let structureShare = readEveryByte ? 0.03 : 0.6
         let structural = Context(file: file, isCancelled: isCancelled) { progress($0 * structureShare) }
-        structural.sampled = forceSampling || seeksAreExpensive(file)
+        structural.sampled = level.places != nil && (forceSampling || seeksAreExpensive(file))
+        structural.sampleCount = level.places ?? Int.max
+        if structural.sampled {
+            structural.chunkBudget = structural.sampleCount
+        } else if level.places == nil {
+            structural.chunkBudget = Int.max
+        }
 
         var result: ContainerResult
         if url.pathExtension.lowercased() == "mkv" {
@@ -183,9 +238,8 @@ enum MediaDamageScanner {
         } else {
             result = try MP4DamageCheck(context: structural).run()
         }
-        if readEveryByte {
-            try fullRead(context: context, result: &result, start: structureShare)
-        }
+        let firstByte = readEveryByte ? 0 : max(0, file.size - tailBytes) & ~4095
+        try fullRead(context: context, result: &result, start: structureShare, from: firstByte)
         if file.failed, !result.findings.contains(where: { $0.text.contains("could not be read") }) {
             result.findings.append(.init(severity: .damaged, text: "Part of the file could not be read (disk error or disconnected)."))
         }
@@ -202,12 +256,12 @@ enum MediaDamageScanner {
     }
 
     /// Reads the whole file in order, reporting read errors and zero runs not already reported.
-    private static func fullRead(context: Context, result: inout ContainerResult, start: Double) throws {
+    private static func fullRead(context: Context, result: inout ContainerResult, start: Double, from firstByte: Int) throws {
         let file = context.file
         let chunk = 8 << 20, page = 4096
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: chunk, alignment: page)
         defer { buffer.deallocate() }
-        var offset = 0, runStart: Int?, unreadable = 0, firstUnreadable: Int?
+        var offset = firstByte, runStart: Int?, unreadable = 0, firstUnreadable: Int?
 
         func finish(_ end: Int) {
             defer { runStart = nil }
@@ -221,7 +275,7 @@ enum MediaDamageScanner {
         }
 
         while offset < file.size {
-            try context.tick(start + (1 - start) * Double(offset) / Double(max(1, file.size)))
+            try context.tick(start + (1 - start) * Double(offset - firstByte) / Double(max(1, file.size - firstByte)))
             let want = min(chunk, file.size - offset)
             let got = file.read(into: buffer, offset: offset, length: want)
             if got < want {
@@ -286,6 +340,8 @@ private final class MKVDamageCheck {
     private var damage: [Range<Int>] = []
     private var damageEntries: [(range: Range<Int>, time: Double?, kind: String)] = []
     private var firstBreakTime: Double?
+    /// Zero-filled runs found by the sampling probes, kept through the exact walk that follows.
+    private var sampleRuns: [Range<Int>] = []
 
     init(context: MediaDamageScanner.Context) {
         self.context = context
@@ -327,6 +383,9 @@ private final class MKVDamageCheck {
             damageEntries = []
             firstBreakTime = nil
             try walkSegment(from: segmentStart)
+            for run in sampleRuns where !damage.contains(where: { $0.overlaps(run) }) {
+                recordDamage(run, at: timeBefore(run.lowerBound), kind: "Zero-filled data")
+            }
         }
         finish(declaredEnd: declaredEnd)
         let offsets = clusterOffsets, times = clusterTimes
@@ -342,6 +401,11 @@ private final class MKVDamageCheck {
         return result
     }
 
+    private func timeBefore(_ offset: Int) -> Double? {
+        let index = lowerBound(clusterOffsets, offset + 1)
+        return index > 0 ? clusterTimes[index - 1] : nil
+    }
+
     /// Checks evenly spaced clusters from the Cues, then walks everything after the last one.
     /// Returns false when there is no usable index or anything looks wrong.
     private func sampledWalk() throws -> Bool {
@@ -352,6 +416,7 @@ private final class MKVDamageCheck {
             if e.id == MKV.cluster { break }
             guard let end = e.dataEnd, end <= size else { return false }
             switch e.id {
+            case MKV.void: result.knownRanges.append(e.dataOffset ..< end)
             case MKV.info: parseInfo(e)
             case MKV.tracks: parseTracks(e)
             case MKV.seekHead: parseSeekHead(e)
@@ -364,10 +429,15 @@ private final class MKVDamageCheck {
         }
         guard cuePositions.count >= 2, let last = cuePositions.last, last < limit else { return false }
 
-        let count = min(MediaDamageScanner.sampleCount, cuePositions.count - 1)
+        // Evenly spaced samples up to the tail, then every cluster of the tail.
+        let tailIndex = min(lowerBound(cuePositions, size - MediaDamageScanner.tailBytes), cuePositions.count - 1)
+        let tailStart = cuePositions[tailIndex]
+        // A quarter of the places check cluster headers, the rest look for zero-filled areas.
+        let count = min(max(1, context.sampleCount / 4), tailIndex)
+        let firstCluster = pos
         var previousTime = 0.0
         for i in 0 ..< count {
-            let offset = cuePositions[i * (cuePositions.count - 1) / count]
+            let offset = cuePositions[i * tailIndex / count]
             try context.tick(0.9 * Double(i) / Double(count))
             guard isPlausibleCluster(at: offset, minimumTime: previousTime) else { return false }
             r.pos = offset
@@ -376,8 +446,12 @@ private final class MKVDamageCheck {
             clusterOffsets.append(offset)
             clusterTimes.append(previousTime)
         }
-        guard isPlausibleCluster(at: last, minimumTime: previousTime) else { return false }
-        try walkSegment(from: last)
+        guard isPlausibleCluster(at: tailStart, minimumTime: previousTime) else { return false }
+        if tailStart > firstCluster {
+            sampleRuns = try context.sampleZeroRuns(firstCluster ..< tailStart, count: context.sampleCount - count)
+            if !sampleRuns.isEmpty { return false }
+        }
+        try walkSegment(from: tailStart)
         guard damageEntries.isEmpty, !result.findings.contains(where: { $0.severity == .damaged }) || limit < size else { return false }
         result.sampled = true
         return true
@@ -938,7 +1012,6 @@ private final class MP4DamageCheck {
         }
 
         let video = tracks.first { $0.handler == "vide" }
-        if let video { try probe(video) }
         let index = (video?.chunks ?? []).sorted { $0.offset < $1.offset }
         let offsets = index.map(\.offset), times = index.map(\.time)
         result.timeAt = { offset in
@@ -948,6 +1021,33 @@ private final class MP4DamageCheck {
                 if offsets[mid] <= offset { lo = mid + 1 } else { hi = mid }
             }
             return lo > 0 ? times[lo - 1] : nil
+        }
+        if context.sampled {
+            try sampleMediaData(sortedMdats)
+        } else if let video {
+            try probe(video)
+        }
+    }
+
+    /// Evenly spaced probes through the media data before the tail, which is always read in full.
+    private func sampleMediaData(_ mdats: [Range<Int>]) throws {
+        let tail = max(0, size - MediaDamageScanner.tailBytes)
+        let ranges = mdats.compactMap { m -> Range<Int>? in
+            let upper = min(m.upperBound, tail)
+            return upper > m.lowerBound ? m.lowerBound ..< upper : nil
+        }
+        let total = ranges.reduce(0) { $0 + $1.count }
+        guard total > 0 else { return }
+        result.sampled = true
+        for range in ranges {
+            let share = Int(Double(context.sampleCount) * Double(range.count) / Double(total))
+            for run in try context.sampleZeroRuns(range, count: max(1, share))
+            where !result.knownRanges.contains(where: { $0.overlaps(run) }) {
+                result.knownRanges.append(run)
+                var text = "\(DamageFormat.bytes(run.count)) of zeros at byte \(run.lowerBound)"
+                if let time = result.timeAt(run.lowerBound) { text += ", around \(DamageFormat.time(time))" }
+                add(.damaged, text + ".")
+            }
         }
     }
 
@@ -965,8 +1065,7 @@ private final class MP4DamageCheck {
     private func probe(_ track: Track) throws {
         let chunks = track.chunks.filter { $0.offset + $0.length <= size }
         guard !chunks.isEmpty else { return }
-        let budget = context.sampled ? MediaDamageScanner.sampleCount : 20000
-        result.sampled = context.sampled && chunks.count > budget
+        let budget = context.chunkBudget
         let step = max(1, chunks.count / budget)
         var indices = Array(stride(from: 0, to: chunks.count, by: step))
         if indices.last != chunks.count - 1 { indices.append(chunks.count - 1) }

@@ -173,7 +173,9 @@ enum CommandLineMode {
             if !a.hasPrefix("--") { files.append(URL(fileURLWithPath: a)) }
         }
         if args.contains("--check") {
-            DamageCheckCLI.run(paths: files, readEveryByte: args.contains("--deep"), forceSampling: args.contains("--sample"))
+            let chosen = args.first { $0.hasPrefix("--level=") }.flatMap { Int($0.dropFirst("--level=".count)) }
+            let level = args.contains("--deep") ? .everyByte : (chosen.flatMap(DamageCheckLevel.init) ?? .standard)
+            DamageCheckCLI.run(paths: files, level: level, forceSampling: args.contains("--sample"))
         }
         let remuxOnly = args.contains("--remux")
         let convertOnly = args.contains("--h265") || remuxOnly

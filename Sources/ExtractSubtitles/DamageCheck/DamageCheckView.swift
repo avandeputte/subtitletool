@@ -32,7 +32,11 @@ final class DamageCheckModel: ObservableObject {
     @Published private(set) var isRunning = false
     @Published private(set) var isCollecting = false
     @Published private(set) var completed = 0
-    @Published var readEveryByte = false
+    @Published var level: DamageCheckLevel = DamageCheckLevel(
+        rawValue: UserDefaults.standard.object(forKey: DamageCheckLevel.storageKey) as? Int ?? -1
+    ) ?? .standard {
+        didSet { UserDefaults.standard.set(level.rawValue, forKey: DamageCheckLevel.storageKey) }
+    }
     @Published var onlyProblems = false
 
     private let cancelFlag = CancelFlag()
@@ -84,7 +88,7 @@ final class DamageCheckModel: ObservableObject {
         rows = []
         cancelFlag.set(false)
         let flag = cancelFlag
-        let everyByte = readEveryByte
+        let level = self.level
 
         Task.detached(priority: .userInitiated) { [weak self] in
             let files = MediaDamageScanner.collectFiles(urls)
@@ -99,7 +103,7 @@ final class DamageCheckModel: ObservableObject {
                 await MainActor.run { row.status = .checking(0) }
                 let status: Status
                 do {
-                    let report = try MediaDamageScanner.scan(url: row.url, readEveryByte: everyByte,
+                    let report = try MediaDamageScanner.scan(url: row.url, level: level,
                                                              isCancelled: { flag.isSet }) { fraction in
                         Task { @MainActor in
                             if case .checking = row.status { row.status = .checking(fraction) }
@@ -176,6 +180,11 @@ struct DamageCheckView: View {
         }
     }
 
+    private var levelBinding: Binding<Double> {
+        Binding(get: { Double(model.level.rawValue) },
+                set: { model.level = DamageCheckLevel(rawValue: Int($0.rounded())) ?? .standard })
+    }
+
     private var controls: some View {
         HStack(spacing: 12) {
             if model.isRunning {
@@ -186,9 +195,14 @@ struct DamageCheckView: View {
                 Button("Check Again") { model.recheck() }
                     .disabled(!model.canRecheck)
             }
-            Toggle("Read every byte", isOn: $model.readEveryByte)
-                .disabled(model.isRunning)
-                .help("Slower. Also finds read errors and zero-filled areas hidden inside a cluster.")
+            VStack(alignment: .leading, spacing: 0) {
+                Slider(value: levelBinding,
+                       in: 0 ... Double(DamageCheckLevel.allCases.count - 1), step: 1)
+                    .frame(width: 170)
+                Text(model.level.label).font(.caption).foregroundStyle(.secondary)
+            }
+            .disabled(model.isRunning)
+            .help("How much of each file to check. Further right is slower and finds smaller damage. The last 1 GB of every file is always read in full.")
             Spacer()
             Text(model.summary).font(.callout).foregroundStyle(.secondary)
             Toggle("Problems only", isOn: $model.onlyProblems)
@@ -321,14 +335,14 @@ final class DamageCheckWindow {
     }
 }
 
-/// `--cli --check [--deep] folder-or-file …` prints one result per file. Exit status 1 if any is damaged.
+/// `--cli --check [--level=0…5] [--deep] folder-or-file …` prints one result per file. Exit status 1 if any is damaged.
 enum DamageCheckCLI {
-    static func run(paths: [URL], readEveryByte: Bool, forceSampling: Bool = false) -> Never {
+    static func run(paths: [URL], level: DamageCheckLevel, forceSampling: Bool = false) -> Never {
         let files = MediaDamageScanner.collectFiles(paths)
         var damaged = 0
         for url in files {
             do {
-                let report = try MediaDamageScanner.scan(url: url, readEveryByte: readEveryByte, forceSampling: forceSampling)
+                let report = try MediaDamageScanner.scan(url: url, level: level, forceSampling: forceSampling)
                 print("[\(report.severity.label)] \(url.path) (\(String(format: "%.1f", report.elapsed))s\(report.sampled ? ", sampled" : ""))")
                 for finding in report.findings { print("    \(finding.text)") }
                 if report.severity == .damaged { damaged += 1 }
