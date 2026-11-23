@@ -26,12 +26,14 @@ enum VideoConversionStep {
         }
         // Forced PGS tracks extracted by this job, or by an earlier run into "<movie> Subtitles".
         let forcedSups: [URL] = await MainActor.run {
-            let folder = job.outputFolder ?? url.deletingPathExtension().deletingLastPathComponent()
-                .appendingPathComponent(url.deletingPathExtension().lastPathComponent + " Subtitles")
+            let folders = job.outputFolder.map { [$0] } ?? OutputLocation.earlierSubtitleFolders(for: url)
             let stem = url.deletingPathExtension().lastPathComponent
-            let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
-            return names.filter { $0.hasPrefix(stem + ".") && $0.hasSuffix(".forced.sup") }.sorted()
-                .map { folder.appendingPathComponent($0) }
+            for folder in folders {
+                let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+                let forced = names.filter { $0.hasPrefix(stem + ".") && $0.hasSuffix(".forced.sup") }.sorted()
+                if !forced.isEmpty { return forced.map { folder.appendingPathComponent($0) } }
+            }
+            return []
         }
         var options = VideoConverter.Options(quality: quality, burnInSubtitles: !remux, ac3Copies: ac3Copies, extraSubtitleFiles: extractedSRTs)
         options.forcedSupFiles = forcedSups

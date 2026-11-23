@@ -14,7 +14,7 @@ For each MKV it:
    When several MKVs are queued, all of them are identified (and all questions asked) before any subtitle
    work starts, so the batch then runs unattended. Everything below uses the new name. Switch off in Settings
    or with `--no-rename`; in `--cli` mode the picker is a numbered list in the terminal (no terminal: the name is kept).
-1. Creates `<movie name> Subtitles/` next to the file.
+1. Creates `<movie name> Subtitles/` next to the file, or in the save folder chosen in Settings.
 2. Demuxes every subtitle track itself (no mkvtoolnix/ffmpeg needed) and writes
    `<movie>.<lang-tag>[.<track name>][.forced][.sdh][.commentary].<ext>`, e.g.
    `Batman (1989).fr-CA.sup`, `Batman (1989).fr-FR.sup`, `Batman (1989).en.sdh.sup`, `Batman (1989).en.forced.sup`.
@@ -83,7 +83,7 @@ VLC all play:
   added as a forced subtitle track instead (Homebrew's ffmpeg has no libass). Other PGS tracks cannot go into an
   MP4 and are left out (they are still extracted as `.sup` / OCR'd to `.srt`).
 * Chapters and the movie title are kept (`-map_chapters 0`, `title=`).
-* Output: `<movie>.mp4` next to the source (after the IMDb rename, e.g. `Batman (1989).mp4`); an existing file is
+* Output: `<movie>.mp4` next to the source or in the save folder chosen in Settings (after the IMDb rename, e.g. `Batman (1989).mp4`); an existing file is
   never overwritten (` 2.mp4`, ` 3.mp4`…). The source is never modified or deleted. Progress (percent, fps,
   time left) is shown in the window with a cancel button; the log shows the exact ffmpeg command, the tracks
   written and the output size/bitrate.

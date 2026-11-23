@@ -264,7 +264,14 @@ enum SubtitleExtractor {
         log?("Processing \(url.path)")
         await MainActor.run { job.state = .scanning }
         let movie = await job.movieName
-        let outDir = url.deletingLastPathComponent().appendingPathComponent(movie + Naming.subfolderSuffix, isDirectory: true)
+        let outDir: URL
+        do {
+            outDir = try OutputLocation.subtitleFolder(for: url, movie: movie)
+        } catch {
+            log?("  error: \(error.localizedDescription)")
+            await MainActor.run { job.state = .failed(error.localizedDescription) }
+            return
+        }
         await MainActor.run { job.outputFolder = outDir }
 
         // 1. Scan + demux on a background thread.

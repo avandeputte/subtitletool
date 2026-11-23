@@ -161,6 +161,11 @@ enum CommandLineMode {
                 skipNext = true
                 continue
             }
+            if a == "--output-folder" {
+                if i + 1 < list.count { OutputLocation.commandLineFolder = list[i + 1] }
+                skipNext = true
+                continue
+            }
             if a == "--compare" {
                 if i + 1 < list.count { compareIMDb = list[i + 1] }
                 skipNext = true
@@ -234,7 +239,7 @@ enum CommandLineMode {
             exit(failures == 0 ? 0 : 1)
         }
         guard !files.isEmpty else {
-            FileHandle.standardError.write(Data("usage: ExtractSubtitles --cli [--list] [--no-convert|--local] [--no-rename|--rename] [--h265|--remux] [--quality 0.9] [--no-ac3] file.mkv …\n       ExtractSubtitles --cli --ocr [--force] [--compare tt1234567] file.sup …\n".utf8))
+            FileHandle.standardError.write(Data("usage: ExtractSubtitles --cli [--list] [--no-convert|--local] [--no-rename|--rename] [--h265|--remux] [--quality 0.9] [--no-ac3] [--output-folder path] file.mkv …\n       ExtractSubtitles --cli --ocr [--force] [--compare tt1234567] file.sup …\n".utf8))
             exit(2)
         }
         if args.contains("--ocr") {

@@ -199,9 +199,9 @@ final class VideoConverter {
         return max(1, min(100, Int(q.rounded())))
     }
 
-    /// "<folder>/<basename>.mp4", never the source, never an existing file.
-    static func outputURL(for source: URL) -> URL {
-        let dir = source.deletingLastPathComponent()
+    /// "<save folder>/<basename>.mp4", never the source, never an existing file.
+    static func outputURL(for source: URL) throws -> URL {
+        let dir = try OutputLocation.folder(for: source)
         let base = source.deletingPathExtension().lastPathComponent
         var url = dir.appendingPathComponent("\(base).mp4")
         var n = 2
@@ -225,7 +225,7 @@ final class VideoConverter {
             log("  remux: the video is copied as it is (no re-encode)")
         }
 
-        let finalURL = VideoConverter.outputURL(for: source)
+        let finalURL = try VideoConverter.outputURL(for: source)
         let tempURL = finalURL.deletingPathExtension().appendingPathExtension("part.mp4")
         let title = source.deletingPathExtension().lastPathComponent
 

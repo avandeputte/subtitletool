@@ -263,6 +263,8 @@ struct SettingsView: View {
     @AppStorage(JobRunner.ac3CopyKey) private var addAC3Copies = true
     @AppStorage(JobRunner.remuxKey) private var remuxVideo = false
     @AppStorage(ReferenceSubtitles.enabledKey) private var compareOnline = false
+    @AppStorage(OutputLocation.useCustomKey) private var saveToCustomFolder = false
+    @AppStorage(OutputLocation.pathKey) private var outputFolderPath = ""
     @State private var osAPIKey = ""
     @State private var osUsername = ""
     @State private var osPassword = ""
@@ -278,8 +280,54 @@ struct SettingsView: View {
         osLoaded = true
     }
 
+    /// Asks for the save folder. Cancelling the first choice goes back to "next to the original".
+    private func chooseOutputFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Choose where to save subtitle folders and MP4 files"
+        if !outputFolderPath.isEmpty { panel.directoryURL = URL(fileURLWithPath: outputFolderPath, isDirectory: true) }
+        if panel.runModal() == .OK, let url = panel.url {
+            outputFolderPath = url.path
+            saveToCustomFolder = true
+        } else if outputFolderPath.isEmpty {
+            saveToCustomFolder = false
+        }
+    }
+
+    private var saveLocationBinding: Binding<Bool> {
+        Binding(get: { saveToCustomFolder && !outputFolderPath.isEmpty },
+                set: { custom in
+                    saveToCustomFolder = custom
+                    if custom, outputFolderPath.isEmpty { chooseOutputFolder() }
+                })
+    }
+
     var body: some View {
         Form {
+            Section("Save results") {
+                Picker("Save subtitles and MP4", selection: saveLocationBinding) {
+                    Text("Next to the original file").tag(false)
+                    Text("In a folder I choose").tag(true)
+                }
+                .pickerStyle(.radioGroup)
+                if saveToCustomFolder, !outputFolderPath.isEmpty {
+                    HStack {
+                        Text(outputFolderPath)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(outputFolderPath)
+                        Spacer()
+                        Button("Change…") { chooseOutputFolder() }
+                    }
+                }
+                Text("Original files stay where they are. If a movie already has results in the chosen folder, the new ones are saved beside them as \"Subtitles 2\" or \"Movie 2.mp4\", so nothing is overwritten.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("File naming") {
                 Toggle("Look the movie up on IMDb and rename to \"Movie Name (yyyy).mkv\"", isOn: $renameFromIMDb)
                 Text("Rip names such as \"Cloud Atlas_t00.mkv\" or \"The.Matrix.1999.1080p.BluRay-GRP.mkv\" are cleaned up (MakeMKV suffixes, release tags) and matched on IMDb; the MKV, its subtitle folder and every subtitle file then use \"Cloud Atlas (2012)\". When several titles fit, the year disagrees or nothing matches exactly, a picker asks you to choose (or to keep the name). With several files queued, every lookup and question comes first, before any subtitle work starts.")
@@ -337,7 +385,7 @@ struct SettingsView: View {
                     }
                 }
                 Toggle("Add an AC-3 copy of every DTS / TrueHD track", isOn: $addAC3Copies)
-                Text("Runs ffmpeg (Homebrew: brew install ffmpeg) the way HandBrake does. Re-encode: the video goes through the Mac's HEVC hardware encoder at the same resolution and frame rate (hvc1, so QuickTime and Apple TV play it) and the forced PGS subtitle track is burned into the picture. Remux: the H.264/HEVC video is copied as it is in seconds; nothing can be burned in, so forced subtitles are carried as a forced text track when they were extracted. In both cases every audio track is copied untouched (AAC, AC-3, E-AC-3, DTS, DTS-HD, TrueHD, FLAC, Opus), text subtitles become subtitle tracks, chapters are kept. DTS and TrueHD cannot be decoded by Apple players, so each such track also gets an AC-3 5.1 copy with the same language, which is the track players start with. The result is <movie>.mp4 next to the original, which is never modified. Also available on their own: right-click an MKV in Finder → Services › Convert to H.265 / Remux to MP4, or the File menu.")
+                Text("Runs ffmpeg (Homebrew: brew install ffmpeg) the way HandBrake does. Re-encode: the video goes through the Mac's HEVC hardware encoder at the same resolution and frame rate (hvc1, so QuickTime and Apple TV play it) and the forced PGS subtitle track is burned into the picture. Remux: the H.264/HEVC video is copied as it is in seconds; nothing can be burned in, so forced subtitles are carried as a forced text track when they were extracted. In both cases every audio track is copied untouched (AAC, AC-3, E-AC-3, DTS, DTS-HD, TrueHD, FLAC, Opus), text subtitles become subtitle tracks, chapters are kept. DTS and TrueHD cannot be decoded by Apple players, so each such track also gets an AC-3 5.1 copy with the same language, which is the track players start with. The result is <movie>.mp4 in the save location chosen above; the original is never modified. Also available on their own: right-click an MKV in Finder → Services › Convert to H.265 / Remux to MP4, or the File menu.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
