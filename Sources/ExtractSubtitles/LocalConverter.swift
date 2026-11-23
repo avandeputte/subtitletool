@@ -218,14 +218,19 @@ enum LocalConverter {
     /// fixes, and the slant of the row's ink decides `italic`.
     static func recognizeLines(_ image: CGImage, languages: [String], cleanupLanguage: String? = nil,
                                pixels: PGSDecoder.OCRPixels? = nil) throws -> [OCRLine] {
+        // ♪ is not in Vision's character set: hide the notes, put them back on the recognised rows.
+        let source: PGSDecoder.OCRPixels? = pixels ?? grayPixels(of: image)
+        let notes: MusicNotes.Result? = source.flatMap { MusicNotes.mask($0) }
+        let visionImage: CGImage = notes.flatMap { PGSDecoder.makeImage($0.pixels) } ?? image
+
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
         if !languages.isEmpty { request.recognitionLanguages = languages }
-        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+        let handler = VNImageRequestHandler(cgImage: visionImage, options: [:])
         try handler.perform([request])
         let observations: [VNRecognizedTextObservation] = request.results ?? []
-        guard !observations.isEmpty else { return [] }
+        guard !observations.isEmpty || notes != nil else { return [] }
 
         // Sort top-to-bottom (Vision's origin is bottom-left), then left-to-right.
         let sorted: [VNRecognizedTextObservation] = observations.sorted { a, b in
@@ -246,30 +251,91 @@ enum LocalConverter {
             rows.append([obs])
         }
 
-        let gray: PGSDecoder.OCRPixels? = pixels ?? grayPixels(of: image)
-        var lines: [OCRLine] = []
+        // Slant is measured without the upright notes.
+        let gray: PGSDecoder.OCRPixels? = notes?.pixels ?? source
+        var placed: [(y: Double, line: OCRLine)] = []
+        var usedBands = Set<Int>()
         for row in rows {
             var parts: [String] = []
             var confidence: Float = 0
-            var italicVotes = 0
-            var votes = 0
             for obs in row.sorted(by: { $0.boundingBox.minX < $1.boundingBox.minX }) {
                 guard let pick = bestCandidate(obs, language: cleanupLanguage) else { continue }
                 let t = pick.string.trimmingCharacters(in: .whitespaces)
                 guard !t.isEmpty else { continue }
                 parts.append(t)
                 confidence = max(confidence, pick.confidence)
-                if let g = gray {
-                    votes += 1
-                    if isItalic(boundingBox: obs.boundingBox, in: g) { italicVotes += 1 }
-                }
             }
             guard !parts.isEmpty else { continue }
-            lines.append(OCRLine(text: parts.joined(separator: " "),
-                                 italic: votes > 0 && italicVotes * 2 > votes,
-                                 confidence: confidence))
+            var text: String = parts.joined(separator: " ")
+            // One slant verdict for the whole row.
+            let rowBox: CGRect = row.dropFirst().reduce(row[0].boundingBox) { $0.union($1.boundingBox) }
+            let rowItalic: Bool = gray.map { isItalic(boundingBox: rowBox, in: $0) } ?? false
+            let midY: Double = 1.0 - row.map { Double($0.boundingBox.midY) }.reduce(0, +) / Double(row.count)
+            let rowY: Double = midY * Double(visionImage.height)
+            if let n = notes, let b = n.bandIndex(forY: rowY), !usedBands.contains(b) {
+                usedBands.insert(b)
+                text = MusicNotes.decorate(text, band: n.bands[b])
+            }
+            placed.append((rowY, OCRLine(text: text,
+                                         italic: rowItalic,
+                                         confidence: confidence)))
         }
-        return lines
+        // Rows that held nothing but notes left no text for Vision to find.
+        if let n = notes {
+            for (i, b) in n.bands.enumerated() where b.notesOnly && !usedBands.contains(i) {
+                placed.append((Double(b.y0 + b.y1) / 2, OCRLine(text: String(repeating: "♪", count: b.leadingCount + b.trailingCount), italic: false, confidence: 1)))
+            }
+        }
+        return placed.sorted { $0.y < $1.y }.map { $0.line }
+    }
+
+    // MARK: - Re-OCR of an extracted .sup
+
+    /// Reads a `.sup` file into one frame per display set, in the form the MKV demuxer produces.
+    static func readSUP(_ url: URL) throws -> [SubtitleFrame] {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        var frames: [SubtitleFrame] = []
+        var current = Data()
+        var timestampNs: Int64 = 0
+        var i = data.startIndex
+        while i + 13 <= data.endIndex {
+            guard data[i] == 0x50, data[i + 1] == 0x47 else { throw Failure.unsupported("this .sup file") }
+            let pts = UInt64(data[i + 2]) << 24 | UInt64(data[i + 3]) << 16 | UInt64(data[i + 4]) << 8 | UInt64(data[i + 5])
+            let type = data[i + 10]
+            let size = Int(data[i + 11]) << 8 | Int(data[i + 12])
+            let end = i + 13 + size
+            guard end <= data.endIndex else { break }
+            if current.isEmpty { timestampNs = Int64(pts) * 1_000_000_000 / 90_000 }
+            current.append(data[(i + 10) ..< end])
+            if type == 0x80 {
+                frames.append(SubtitleFrame(timestampNs: timestampNs, durationNs: nil, payload: current))
+                current = Data()
+            }
+            i = end
+        }
+        return frames
+    }
+
+    /// OCRs `<name>.sup` to `<name>.srt` next to it. An existing SRT is only replaced with `force`;
+    /// otherwise the result goes to `<name> 2.srt` (or the next free number).
+    static func ocrSUPFile(_ url: URL, force: Bool, progress: ((Double) -> Void)? = nil) async throws -> URL {
+        let stem: String = url.deletingPathExtension().lastPathComponent
+        var movie = ""
+        if let r = stem.range(of: #"\(\d{4}\)"#, options: .regularExpression) { movie = String(stem[..<r.upperBound]) }
+        let tag: String = TimedText.describe(fileName: url.lastPathComponent, movie: movie).tag
+        let cues = try await ocrPGS(frames: try readSUP(url), language: tag, progress: progress)
+
+        let folder = url.deletingLastPathComponent()
+        var out = folder.appendingPathComponent(stem + ".srt")
+        if !force {
+            var n = 2
+            while FileManager.default.fileExists(atPath: out.path) {
+                out = folder.appendingPathComponent("\(stem) \(n).srt")
+                n += 1
+            }
+        }
+        try encodeSRT(cues).write(to: out, options: .atomic)
+        return out
     }
 
     /// Of the top 3 candidates, the one that needs the fewest clean-up fixes; ties go to confidence.
@@ -290,9 +356,7 @@ enum LocalConverter {
 
     // MARK: Italic detection
 
-    /// Estimates whether a text row is slanted: the horizontal centroid of dark pixels in the top
-    /// third of the band is compared with that of the bottom third; a right shift of more than
-    /// 0.12 × band height means italic. Tiny or very short bands are never italic.
+    /// Whether a text row is slanted. Tiny or very short bands are never italic.
     static func isItalic(boundingBox box: CGRect, in p: PGSDecoder.OCRPixels) -> Bool {
         guard p.width > 0, p.height > 0, p.gray.count == p.width * p.height else { return false }
         let w = Double(p.width), h = Double(p.height)
@@ -304,52 +368,9 @@ enum LocalConverter {
         y0 = max(0, min(p.height, y0)); y1 = max(0, min(p.height, y1))
         let bw: Int = x1 - x0
         let bh: Int = y1 - y0
-        guard bh >= 12, bw >= 2 * bh else { return false }
+        guard bh >= 12, bw >= bh else { return false }
 
-        let third: Int = bh / 3
-        guard third >= 3 else { return false }
-        let topRows: Range<Int> = y0 ..< (y0 + third)
-        let bottomRows: Range<Int> = (y1 - third) ..< y1
-        let dark: UInt8 = 128
-
-        // Centroid of dark pixels within given rows and columns; nil when too few.
-        func centroid(rows: Range<Int>, cols: Range<Int>, minCount: Int) -> Double? {
-            var sum: Int = 0
-            var n: Int = 0
-            for yy in rows {
-                let base: Int = yy * p.width
-                for xx in cols where p.gray[base + xx] < dark {
-                    sum += xx
-                    n += 1
-                }
-            }
-            guard n >= minCount else { return nil }
-            return Double(sum) / Double(n)
-        }
-
-        let cols: Range<Int> = x0 ..< x1
-        guard let top = centroid(rows: topRows, cols: cols, minCount: bh),
-              let bottom = centroid(rows: bottomRows, cols: cols, minCount: bh) else { return false }
-        let shift: Double = top - bottom
-        let threshold: Double = 0.12 * Double(bh)
-        guard shift > threshold else { return false }
-
-        // Sanity check against lopsided glyph distribution: the same shift must show up in most
-        // chunks of the row (chunk width ≈ band height) when there are enough of them.
-        var chunkShifts: [Double] = []
-        var cx: Int = x0
-        while cx + bh <= x1 {
-            let range: Range<Int> = cx ..< (cx + bh)
-            if let t = centroid(rows: topRows, cols: range, minCount: third),
-               let b = centroid(rows: bottomRows, cols: range, minCount: third) {
-                chunkShifts.append(t - b)
-            }
-            cx += bh
-        }
-        guard chunkShifts.count >= 3 else { return true }
-        let sortedShifts = chunkShifts.sorted()
-        let median: Double = sortedShifts[sortedShifts.count / 2]
-        return median > 0.06 * Double(bh)
+        return MusicNotes.isSlanted(p, x0: x0, x1: x1, y0: y0, y1: y1)
     }
 
     /// Grayscale pixels of any CGImage (top row first), used when the decoder did not supply them.
@@ -446,7 +467,8 @@ enum OCRCleanup {
             }
             let content: String = tokens.filter { !$0.isTag }.map { $0.text }.joined()
             guard !content.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
-            lines.append(tokens.map { $0.text }.joined().trimmingCharacters(in: .whitespaces))
+            lines.append(restoreNotes(tokens.map { $0.text }.joined().trimmingCharacters(in: .whitespaces),
+                                      english: english))
         }
         return fixQuotes(lines.joined(separator: "\n"))
     }
@@ -469,6 +491,53 @@ enum OCRCleanup {
             n += s.filter { $0 == "`" }.count
         }
         return n
+    }
+
+    // MARK: ♪ misreads
+
+    private static let noteSymbols: Set<String> = ["&", "¿", "§", ">", "<", "›", "«", "»", "•", "~", "^", "б"]
+    private static let noteLetters: Set<String> = ["s", "S", "f", "j", "d", "8"]
+    /// Real words: only trusted at the start of a line whose end is also a misread note.
+    private static let noteWords: Set<String> = ["of", "os", "as"]
+
+    /// Safety net for notes the bitmap detector missed: a line with a misread ♪ at both ends, or at
+    /// one end with a real ♪ at the other, gets real notes.
+    static func restoreNotes(_ line: String, english: Bool) -> String {
+        var body = Substring(line)
+        var open = "", close = ""
+        while body.hasPrefix("<"), let r = body.range(of: #"^</?[ibu]>"#, options: .regularExpression) {
+            open += body[r]
+            body = body[r.upperBound...]
+        }
+        while body.hasSuffix(">"), let r = body.range(of: #"</?[ibu]>$"#, options: .regularExpression) {
+            close = body[r] + close
+            body = body[..<r.lowerBound]
+        }
+        var dash = ""
+        if body.hasPrefix("- ") { dash = "- "; body = body.dropFirst(2) }
+        // A pair of notes before a sound description reads as "dr [".
+        if english, body.hasPrefix("dr [") || body.hasPrefix("d [") {
+            return open + dash + "♪♪ " + body[body.firstIndex(of: "[")!...] + close
+        }
+        // A note right after a speaker label: "[company] & Alex got better".
+        if let r = body.range(of: #"^\[[^\]]+\] "#, options: .regularExpression) {
+            let rest = body[r.upperBound...]
+            if let space = rest.firstIndex(of: " "), noteSymbols.contains(String(rest[..<space])) {
+                let fixed = String(body[..<r.upperBound]) + "♪" + String(rest[space...])
+                return open + dash + fixed + close
+            }
+        }
+        var words: [String] = body.components(separatedBy: " ")
+        guard words.count >= 3, let first = words.first, let last = words.last else { return line }
+
+        func misread(_ w: String) -> Bool { noteSymbols.contains(w) || (english && noteLetters.contains(w)) }
+        let lastMisread: Bool = misread(last)
+        let firstMisread: Bool = misread(first) || (english && lastMisread && noteWords.contains(first))
+        guard firstMisread || lastMisread,
+              firstMisread || first == "♪", lastMisread || last == "♪" else { return line }
+        words[0] = "♪"
+        words[words.count - 1] = "♪"
+        return open + dash + words.joined(separator: " ") + close
     }
 
     // MARK: Internals
@@ -542,7 +611,7 @@ enum OCRCleanup {
     private static let tagRegex: NSRegularExpression = rx("</?[ibu]>")
     private static let leadingSpace: NSRegularExpression = rx("^[ \\t]+")
     private static let trailingSpace: NSRegularExpression = rx("[ \\t]+$")
-    private static let leadingDash: NSRegularExpression = rx("^[-\\u2013\\u2014]{1,2}[ \\t]*(?=\\S)")
+    private static let leadingDash: NSRegularExpression = rx("^(?:[-\\u2013\\u2014][ \\t]*){1,2}(?=\\S)")
     private static let spacedDots: NSRegularExpression = rx("\\.(?:[ \\t]+\\.){2,}")
     private static let manyDots: NSRegularExpression = rx("\\.{4,}")
     private static let twoDots: NSRegularExpression = rx("(?<!\\.)\\.\\.(?!\\.)")
@@ -567,6 +636,38 @@ enum OCRCleanup {
         Fix(regex: rx("(?<!\\d)\\|(?!\\d)"), template: "I"),
         // 1'm / 1'll / 1've / 1'd -> I'm …
         Fix(regex: rx("(?<![\\p{L}\\p{N}])1(?='(m|ll|ve|d)\\b)"), template: "I"),
+        // Pronoun forms that lost the apostrophe or start with l
+        Fix(regex: rx("\\b(?:Im|lm|lim)\\b"), template: "I'm"),
+        Fix(regex: rx("\\blam\\b"), template: "I am"),
+        Fix(regex: rx("\\b(?:lve|Ive)\\b"), template: "I've"),
+        Fix(regex: rx("\\b(?:ld|Id)\\b"), template: "I'd"),
+        Fix(regex: rx("\\blll\\b"), template: "I'll"),
+        Fix(regex: rx("\\blf\\b"), template: "If"),
+        Fix(regex: rx("\\bWeill\\b"), template: "We'll"),
+        Fix(regex: rx("\\bMil\\b"), template: "I'll"),
+        // "1" before a lowercase word is the pronoun, unless it counts something ("1 mile", "$1 bill")
+        Fix(regex: rx("(?<![\\d$.,:])(?<!at )\\b1 (?=[a-z])(?!(?:pm|st|nd|rd|th|of|in|out|or|and|to|more|mile|miles|day|week|month|year|hour|minute|second|inch|foot|yard|acre|percent|dollar|cent|buck|million|billion|thousand|hundred)\\b)"), template: "I "),
+        Fix(regex: rx("\"(?=cause\\b)"), template: "'"),
+        // Contractions that lost the apostrophe ("lets" is a real word and stays)
+        Fix(regex: rx("\\b([Cc])ant\\b"), template: "$1an't"),
+        Fix(regex: rx("\\b([Dd])ont\\b"), template: "$1on't"),
+        Fix(regex: rx("\\b([Ww])ont\\b"), template: "$1on't"),
+        Fix(regex: rx("\\b([Aa])int\\b"), template: "$1in't"),
+        Fix(regex: rx("\\b([Ii])snt\\b"), template: "$1sn't"),
+        Fix(regex: rx("\\b([Dd])idnt\\b"), template: "$1idn't"),
+        Fix(regex: rx("\\b([Yy])oure\\b"), template: "$1ou're"),
+        Fix(regex: rx("\\b([Tt])heyre\\b"), template: "$1hey're"),
+        Fix(regex: rx("\\b([Ww])hats\\b"), template: "$1hat's"),
+        Fix(regex: rx("\\b([Tt])hats\\b"), template: "$1hat's"),
+        // Smaller misreads: it'il, 1am (not "at 1am"), tellas, a bullet in mid-sentence
+        Fix(regex: rx("(?<=\\p{L})'il\\b"), template: "'ll"),
+        Fix(regex: rx("(?<![\\d:])(?<!at )\\b1am\\b"), template: "I am"),
+        Fix(regex: rx("\\b([Tt])ellas\\b"), template: "fellas"),
+        Fix(regex: rx("(?<=\\p{L}) • (?=\\p{L})"), template: " "),
+        // A lone slash, or "1 am" opening a line, is the pronoun
+        Fix(regex: rx("(?<!\\S)/(?=\\s)"), template: "I"),
+        Fix(regex: rx("(?<!\\S)/(?=[a-z])"), template: "I "),
+        Fix(regex: rx("^((?:-\\s*)?(?:♪\\s*)?)1 am\\b"), template: "$1I am"),
     ]
 
     private static func replace(_ s: String, _ regex: NSRegularExpression, with template: String) -> String {

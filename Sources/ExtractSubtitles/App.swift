@@ -208,8 +208,26 @@ enum CommandLineMode {
             exit(failures == 0 ? 0 : 1)
         }
         guard !files.isEmpty else {
-            FileHandle.standardError.write(Data("usage: ExtractSubtitles --cli [--list] [--no-convert|--local] [--no-rename|--rename] [--h265|--remux] [--quality 0.9] [--no-ac3] file.mkv …\n".utf8))
+            FileHandle.standardError.write(Data("usage: ExtractSubtitles --cli [--list] [--no-convert|--local] [--no-rename|--rename] [--h265|--remux] [--quality 0.9] [--no-ac3] file.mkv …\n       ExtractSubtitles --cli --ocr [--force] file.sup …\n".utf8))
             exit(2)
+        }
+        if args.contains("--ocr") {
+            // Redo the OCR of extracted .sup files; the MKV is not needed.
+            let force = args.contains("--force")
+            Task.detached {
+                var failures = 0
+                for url in files {
+                    print("OCR \(url.lastPathComponent)")
+                    do {
+                        let out = try await LocalConverter.ocrSUPFile(url, force: force)
+                        print("  wrote \(out.lastPathComponent)")
+                    } catch {
+                        print("  error: \(error.localizedDescription)"); failures += 1
+                    }
+                }
+                exit(failures == 0 ? 0 : 1)
+            }
+            while true { RunLoop.main.run(mode: .default, before: .distantFuture) }
         }
         var mode = ConversionMode.from(stored: UserDefaults.standard.string(forKey: ConversionMode.storageKey))
         if args.contains("--no-convert") { mode = .off }
