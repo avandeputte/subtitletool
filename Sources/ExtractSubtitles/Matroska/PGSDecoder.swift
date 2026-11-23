@@ -240,6 +240,7 @@ enum PGSDecoder {
         // pixel), so the thin dark outline weighs less than the glyph fill.
         var sumEroded: Int = 0, nEroded: Int = 0
         var sumAll: Int = 0, nAll: Int = 0
+        var brightEroded: Int = 0, peakLum: UInt8 = 0
         for yy in by0 ... by1 {
             for xx in bx0 ... bx1 {
                 let o: Int = yy * canvasW + xx
@@ -253,7 +254,11 @@ enum PGSDecoder {
                         break
                     }
                 }
-                if interior { sumEroded += Int(lum[o]); nEroded += 1 }
+                if interior {
+                    sumEroded += Int(lum[o]); nEroded += 1
+                    if lum[o] >= 90 { brightEroded += 1 }
+                    peakLum = max(peakLum, lum[o])
+                }
             }
         }
         let meanLum: Double
@@ -265,7 +270,11 @@ enum PGSDecoder {
             meanLum = 255
         }
         // Biased towards "light": PGS text is almost always white on a dark outline.
-        let lightText: Bool = meanLum >= 100
+        // UHD discs often use a dim gray fill with a thick black outline: the outline can outweigh
+        // the fill in the mean, so a good share of bright interior pixels also means light text.
+        let lightText: Bool = meanLum >= 100 || (nEroded >= 16 && brightEroded * 100 >= nEroded * 30)
+        // Dim fills are stretched to full contrast so the text reaches black after inverting.
+        let stretch: Double = nEroded >= 16 ? 255.0 / Double(max(peakLum, 90)) : 1.0
 
         // Crop with an 8 px margin and composite onto opaque white (dark ink).
         let margin = 8
@@ -285,7 +294,7 @@ enum PGSDecoder {
                 let v: Double
                 if lightText {
                     // Composite over black, then invert: text -> dark, outline/background -> white.
-                    v = 255.0 - a * l
+                    v = 255.0 - a * min(255.0, l * stretch)
                 } else {
                     // Dark text: composite over white.
                     v = a * l + (1.0 - a) * 255.0
