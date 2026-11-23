@@ -659,6 +659,11 @@ enum OCRCleanup {
         Fix(regex: rx("\\b([Tt])heyre\\b"), template: "$1hey're"),
         Fix(regex: rx("\\b([Ww])hats\\b"), template: "$1hat's"),
         Fix(regex: rx("\\b([Tt])hats\\b"), template: "$1hat's"),
+        // Smaller misreads: it'il, 1am (not "at 1am"), tellas, a bullet in mid-sentence
+        Fix(regex: rx("(?<=\\p{L})'il\\b"), template: "'ll"),
+        Fix(regex: rx("(?<![\\d:])(?<!at )\\b1am\\b"), template: "I am"),
+        Fix(regex: rx("\\b([Tt])ellas\\b"), template: "fellas"),
+        Fix(regex: rx("(?<=\\p{L}) \u2022 (?=\\p{L})"), template: " "),
         // A lone slash, or "1 am" opening a line, is the pronoun
         Fix(regex: rx("(?<!\\S)/(?=\\s)"), template: "I"),
         Fix(regex: rx("(?<!\\S)/(?=[a-z])"), template: "I "),
