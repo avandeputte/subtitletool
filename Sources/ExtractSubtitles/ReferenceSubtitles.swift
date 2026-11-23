@@ -598,6 +598,7 @@ enum ReferenceSubtitles {
         guard !coreRef.isEmpty, !coreOCR.isEmpty else { return ocr }
         if coreOCR.lowercased() == coreRef.lowercased() { return ocr }
         if coreOCR.contains("'") && !coreRef.contains("'") { return ocr }
+        if coreOCR.contains(where: { ",.;:!?".contains($0) }) { return ocr }   // punctuation inside quotes
         if coreOCR.count > 1 && coreOCR.allSatisfy({ $0.isNumber }) { return ocr }   // a real number
         var core: String = coreRef
         if coreOCR == coreOCR.uppercased(), coreOCR != coreOCR.lowercased(), coreOCR.count > 1 {
