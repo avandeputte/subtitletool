@@ -27,6 +27,9 @@ struct ExtractSubtitlesApp: App {
                     .keyboardShortcut("o", modifiers: [.command, .shift])
                 Button("Remux to MP4…") { appDelegate.runner.openPanel(kind: .remux) }
                     .keyboardShortcut("o", modifiers: [.command, .option])
+                Divider()
+                Button("Check for Damage…") { DamageCheckWindow.shared.show() }
+                    .keyboardShortcut("d", modifiers: [.command, .shift])
             }
         }
 
@@ -89,6 +92,18 @@ final class ServiceProvider: NSObject {
             NSApp.activate(ignoringOtherApps: true)
             self.runner.enqueue(urls)
         }
+    }
+
+    /// Finder "Check for Damage" service: read-only check of videos and folders.
+    @objc(checkForDamage:userData:error:)
+    func checkForDamage(_ pboard: NSPasteboard, userData: String, error: AutoreleasingUnsafeMutablePointer<NSString>) {
+        let urls = (pboard.readObjects(forClasses: [NSURL.self],
+                                       options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+        guard !urls.isEmpty else {
+            error.pointee = "No files were passed to Check for Damage." as NSString
+            return
+        }
+        Task { @MainActor in DamageCheckWindow.shared.show(checking: urls) }
     }
 
     /// Finder "Convert to H.265" service: converts the video only, no subtitle extraction.
@@ -156,6 +171,9 @@ enum CommandLineMode {
                 continue
             }
             if !a.hasPrefix("--") { files.append(URL(fileURLWithPath: a)) }
+        }
+        if args.contains("--check") {
+            DamageCheckCLI.run(paths: files, readEveryByte: args.contains("--deep"))
         }
         let remuxOnly = args.contains("--remux")
         let convertOnly = args.contains("--h265") || remuxOnly
